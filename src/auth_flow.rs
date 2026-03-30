@@ -57,6 +57,17 @@ pub fn parse_browser_callback(
         .map_err(|err| AppError::bad_request(format!("invalid callback_url: {err}")))?;
     let query = url.query_pairs().collect::<Vec<_>>();
 
+    let callback_state = query
+        .iter()
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| value.to_string())
+        .ok_or_else(|| AppError::bad_request("callback_url is missing state"))?;
+    if callback_state != expected_state {
+        return Err(AppError::bad_request(
+            "callback_url state did not match auth session",
+        ));
+    }
+
     let error_code = query
         .iter()
         .find(|(key, _)| key == "error")
@@ -70,17 +81,6 @@ pub fn parse_browser_callback(
             &error_code,
             error_description.as_deref(),
         )));
-    }
-
-    let callback_state = query
-        .iter()
-        .find(|(key, _)| key == "state")
-        .map(|(_, value)| value.to_string())
-        .ok_or_else(|| AppError::bad_request("callback_url is missing state"))?;
-    if callback_state != expected_state {
-        return Err(AppError::bad_request(
-            "callback_url state did not match auth session",
-        ));
     }
 
     let oauth_code = query
@@ -326,6 +326,8 @@ fn callback_error_message(error_code: &str, error_description: Option<&str>) -> 
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TokenEndpointErrorDetail {
+    error_code: Option<String>,
+    error_message: Option<String>,
     display_message: String,
 }
 
@@ -405,16 +407,33 @@ fn parse_token_endpoint_error(body: &str) -> TokenEndpointErrorDetail {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return TokenEndpointErrorDetail {
+            error_code: None,
+            error_message: None,
             display_message: "unknown error".to_string(),
         };
     }
 
     let parsed = serde_json::from_str::<JsonValue>(trimmed).ok();
     if let Some(json) = parsed {
+        let error_code = json
+            .get("error")
+            .and_then(JsonValue::as_str)
+            .filter(|error_code| !error_code.trim().is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                json.get("error")
+                    .and_then(JsonValue::as_object)
+                    .and_then(|error_obj| error_obj.get("code"))
+                    .and_then(JsonValue::as_str)
+                    .filter(|code| !code.trim().is_empty())
+                    .map(ToString::to_string)
+            });
         if let Some(description) = json.get("error_description").and_then(JsonValue::as_str)
             && !description.trim().is_empty()
         {
             return TokenEndpointErrorDetail {
+                error_code,
+                error_message: Some(description.to_string()),
                 display_message: description.to_string(),
             };
         }
@@ -423,30 +442,23 @@ fn parse_token_endpoint_error(body: &str) -> TokenEndpointErrorDetail {
             && !message.trim().is_empty()
         {
             return TokenEndpointErrorDetail {
+                error_code,
+                error_message: Some(message.to_string()),
                 display_message: message.to_string(),
             };
         }
-        if let Some(error_code) = json.get("error").and_then(JsonValue::as_str)
-            && !error_code.trim().is_empty()
-        {
+        if let Some(error_code) = error_code {
             return TokenEndpointErrorDetail {
-                display_message: error_code.to_string(),
-            };
-        }
-        if let Some(error_code) = json
-            .get("error")
-            .and_then(JsonValue::as_object)
-            .and_then(|error_obj| error_obj.get("code"))
-            .and_then(JsonValue::as_str)
-            && !error_code.trim().is_empty()
-        {
-            return TokenEndpointErrorDetail {
-                display_message: error_code.to_string(),
+                display_message: error_code.clone(),
+                error_code: Some(error_code),
+                error_message: None,
             };
         }
     }
 
     TokenEndpointErrorDetail {
+        error_code: None,
+        error_message: None,
         display_message: trimmed.to_string(),
     }
 }
@@ -467,7 +479,58 @@ mod tests {
             r#"{"error":"invalid_grant","error_description":"refresh token expired"}"#,
         );
 
-        assert_eq!(detail.to_string(), "refresh token expired");
+        assert_eq!(
+            detail,
+            TokenEndpointErrorDetail {
+                error_code: Some("invalid_grant".to_string()),
+                error_message: Some("refresh token expired".to_string()),
+                display_message: "refresh token expired".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_token_endpoint_error_reads_nested_error_message_and_code() {
+        let detail = parse_token_endpoint_error(
+            r#"{"error":{"code":"invalid_grant","message":"refresh token revoked"}}"#,
+        );
+
+        assert_eq!(
+            detail,
+            TokenEndpointErrorDetail {
+                error_code: Some("invalid_grant".to_string()),
+                error_message: Some("refresh token revoked".to_string()),
+                display_message: "refresh token revoked".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_token_endpoint_error_falls_back_to_error_code() {
+        let detail = parse_token_endpoint_error(r#"{"error":"temporarily_unavailable"}"#);
+
+        assert_eq!(
+            detail,
+            TokenEndpointErrorDetail {
+                error_code: Some("temporarily_unavailable".to_string()),
+                error_message: None,
+                display_message: "temporarily_unavailable".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_token_endpoint_error_preserves_plain_text_for_display() {
+        let detail = parse_token_endpoint_error("service unavailable");
+
+        assert_eq!(
+            detail,
+            TokenEndpointErrorDetail {
+                error_code: None,
+                error_message: None,
+                display_message: "service unavailable".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -484,6 +547,20 @@ mod tests {
             callback_error_message("invalid_request", None),
             "Sign-in failed: invalid_request"
         );
+    }
+
+    #[test]
+    fn browser_callback_rejects_state_mismatch_before_oauth_error() {
+        let callback_url =
+            "http://localhost:1455/auth/callback?state=wrong-state&error=access_denied";
+
+        match parse_browser_callback(callback_url, "expected-state") {
+            Err(AppError::BadRequest(message)) => {
+                assert_eq!(message, "callback_url state did not match auth session");
+            }
+            Err(err) => panic!("unexpected callback error kind: {err}"),
+            Ok(_) => panic!("state mismatch should fail before oauth callback error handling"),
+        }
     }
 
     #[test]

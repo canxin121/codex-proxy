@@ -88,6 +88,7 @@ use sea_orm::QueryOrder;
 use sea_orm::Set;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::path::PathBuf;
 use tokio_tungstenite::Connector;
@@ -969,6 +970,8 @@ async fn proxy_responses_ws(
     let client_headers = headers.clone();
     let credential = selected.model;
     let credential_id = credential.id.clone();
+    let websocket_prompt_cache_key = resolve_session_key_from_headers(&client_headers)
+        .unwrap_or_else(|| codex_prompt_cache_key(&credential.id));
     let manager = state.auth_manager(&credential_id).await;
 
     let upstream =
@@ -1023,6 +1026,7 @@ async fn proxy_responses_ws(
             principal,
             credential.clone(),
             upstream.stream,
+            websocket_prompt_cache_key.clone(),
         )
         .await
         {
@@ -1042,6 +1046,7 @@ async fn run_ws_proxy(
     mut upstream: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    prompt_cache_key: String,
 ) -> Result<(), AppError> {
     let mut current_request: Option<ActiveWebsocketRequest> = None;
     let mut terminal_error: Option<AppError> = None;
@@ -1090,7 +1095,10 @@ async fn run_ws_proxy(
                                 );
                             }
                         }
-                        let Some(upstream_message) = map_client_ws_message(message) else {
+                        let Some(upstream_message) = map_client_ws_message(
+                            message,
+                            Some(prompt_cache_key.as_str()),
+                        ) else {
                             continue;
                         };
                         if let Err(err) = upstream.send(upstream_message).await {
@@ -1488,9 +1496,24 @@ async fn map_upstream_ws_message(
     }
 }
 
-fn map_client_ws_message(message: ClientWsMessage) -> Option<UpstreamWsMessage> {
+fn map_client_ws_message(
+    message: ClientWsMessage,
+    prompt_cache_key: Option<&str>,
+) -> Option<UpstreamWsMessage> {
     match message {
-        ClientWsMessage::Text(text) => Some(UpstreamWsMessage::Text(text.to_string().into())),
+        ClientWsMessage::Text(text) => {
+            if let Some(prompt_cache_key) = prompt_cache_key
+                && let Some((normalized, _)) =
+                    normalize_prompt_cache_key(text.as_bytes(), prompt_cache_key)
+            {
+                return Some(UpstreamWsMessage::Text(
+                    String::from_utf8(normalized)
+                        .expect("normalized prompt cache key body should remain UTF-8")
+                        .into(),
+                ));
+            }
+            Some(UpstreamWsMessage::Text(text.to_string().into()))
+        }
         ClientWsMessage::Binary(data) => Some(UpstreamWsMessage::Binary(data)),
         ClientWsMessage::Ping(data) => Some(UpstreamWsMessage::Ping(data)),
         ClientWsMessage::Pong(data) => Some(UpstreamWsMessage::Pong(data)),
@@ -1525,10 +1548,7 @@ async fn sync_rate_limits_from_ws_text(
 ) -> Result<(), AppError> {
     if let Some(snapshot) = parse_rate_limit_event(text) {
         state
-            .update_rate_limits_from_headers(
-                credential_id,
-                &header_map_from_snapshots(std::slice::from_ref(&snapshot)),
-            )
+            .update_rate_limit_snapshot(credential_id, snapshot)
             .await?;
     }
 
@@ -1536,14 +1556,18 @@ async fn sync_rate_limits_from_ws_text(
         Ok(json) => json,
         Err(_) => return Ok(()),
     };
-    if let Some(headers) = json.headers {
-        let header_map = header_map_from_json(headers);
-        let snapshots = parse_all_rate_limits(&header_map);
-        if !snapshots.is_empty() {
-            state
-                .update_rate_limits_from_headers(credential_id, &header_map)
-                .await?;
-        }
+
+    if let Some(header_map) = maybe_extract_header_map_for_rate_limits(json.headers) {
+        state
+            .update_rate_limits_from_headers(credential_id, &header_map)
+            .await?;
+    }
+    if let Some(header_map) = maybe_extract_header_map_for_rate_limits(
+        json.response.and_then(|response| response.headers),
+    ) {
+        state
+            .update_rate_limits_from_headers(credential_id, &header_map)
+            .await?;
     }
     Ok(())
 }
@@ -1551,6 +1575,22 @@ async fn sync_rate_limits_from_ws_text(
 #[derive(Debug, Deserialize)]
 struct WsEnvelope {
     headers: Option<Value>,
+    response: Option<WsResponseEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WsResponseEnvelope {
+    headers: Option<Value>,
+}
+
+fn maybe_extract_header_map_for_rate_limits(headers: Option<Value>) -> Option<HeaderMap> {
+    let header_map = header_map_from_json(headers?);
+    let snapshots = parse_all_rate_limits(&header_map);
+    if snapshots.is_empty() {
+        None
+    } else {
+        Some(header_map)
+    }
 }
 
 fn header_map_from_json(value: Value) -> HeaderMap {
@@ -1591,62 +1631,6 @@ fn json_header_value(value: &Value) -> Option<Cow<'_, str>> {
         .map(|boolean| Cow::Owned(boolean.to_string()))
 }
 
-fn header_map_from_snapshots(
-    snapshots: &[codex_protocol::protocol::RateLimitSnapshot],
-) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    for snapshot in snapshots {
-        let limit_id = snapshot
-            .limit_id
-            .clone()
-            .unwrap_or_else(|| "codex".to_string())
-            .replace('_', "-");
-        if let Some(window) = snapshot.primary.as_ref() {
-            insert_header_value(
-                &mut headers,
-                format!("x-{limit_id}-primary-used-percent"),
-                window.used_percent.to_string(),
-            );
-            if let Some(window_minutes) = window.window_minutes {
-                insert_header_value(
-                    &mut headers,
-                    format!("x-{limit_id}-primary-window-minutes"),
-                    window_minutes.to_string(),
-                );
-            }
-            if let Some(reset_at) = window.resets_at {
-                insert_header_value(
-                    &mut headers,
-                    format!("x-{limit_id}-primary-reset-at"),
-                    reset_at.to_string(),
-                );
-            }
-        }
-        if let Some(window) = snapshot.secondary.as_ref() {
-            insert_header_value(
-                &mut headers,
-                format!("x-{limit_id}-secondary-used-percent"),
-                window.used_percent.to_string(),
-            );
-            if let Some(window_minutes) = window.window_minutes {
-                insert_header_value(
-                    &mut headers,
-                    format!("x-{limit_id}-secondary-window-minutes"),
-                    window_minutes.to_string(),
-                );
-            }
-            if let Some(reset_at) = window.resets_at {
-                insert_header_value(
-                    &mut headers,
-                    format!("x-{limit_id}-secondary-reset-at"),
-                    reset_at.to_string(),
-                );
-            }
-        }
-    }
-    headers
-}
-
 fn insert_header_value(headers: &mut HeaderMap, name: String, value: String) {
     if let (Ok(name), Ok(value)) = (
         http::header::HeaderName::try_from(name),
@@ -1654,6 +1638,116 @@ fn insert_header_value(headers: &mut HeaderMap, name: String, value: String) {
     ) {
         let _ = headers.insert(name, value);
     }
+}
+
+fn codex_prompt_cache_key(seed: &str) -> String {
+    let digest = Sha256::digest(format!("codex-proxy:prompt-cache:{seed}"));
+    let mut key = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        write!(&mut key, "{byte:02x}").expect("writing to a string should not fail");
+    }
+    key
+}
+
+fn normalize_prompt_cache_key(raw_json: &[u8], fallback_key: &str) -> Option<(Vec<u8>, String)> {
+    if raw_json.is_empty() {
+        return None;
+    }
+
+    let mut value: Value = serde_json::from_slice(raw_json).ok()?;
+    if let Some(existing_key) = value
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    {
+        return Some((raw_json.to_vec(), existing_key.to_string()));
+    }
+
+    let object = value.as_object_mut()?;
+    object.insert(
+        "prompt_cache_key".to_string(),
+        Value::String(fallback_key.to_string()),
+    );
+    let bytes = serde_json::to_vec(&value).ok()?;
+    Some((bytes, fallback_key.to_string()))
+}
+
+fn normalize_prompt_cache_key_for_request(
+    client_headers: &HeaderMap,
+    body: Bytes,
+    fallback_key: &str,
+) -> Result<(Bytes, String), AppError> {
+    if body.is_empty() {
+        return Ok((body, fallback_key.to_string()));
+    }
+
+    let content_encoding = client_headers
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+
+    if content_encoding.eq_ignore_ascii_case("zstd") {
+        let decoded = zstd::stream::decode_all(std::io::Cursor::new(body.as_ref()))
+            .map_err(|err| AppError::bad_request(err.to_string()))?;
+        if let Some((normalized, prompt_cache_key)) =
+            normalize_prompt_cache_key(&decoded, fallback_key)
+        {
+            let encoded = zstd::stream::encode_all(std::io::Cursor::new(normalized.as_slice()), 3)
+                .map_err(|err| AppError::internal(err.to_string()))?;
+            return Ok((Bytes::from(encoded), prompt_cache_key));
+        }
+        return Ok((body, fallback_key.to_string()));
+    }
+
+    if let Some((normalized, prompt_cache_key)) =
+        normalize_prompt_cache_key(body.as_ref(), fallback_key)
+    {
+        return Ok((Bytes::from(normalized), prompt_cache_key));
+    }
+
+    Ok((body, fallback_key.to_string()))
+}
+
+fn resolve_session_key_from_headers(headers: &HeaderMap) -> Option<String> {
+    const CANDIDATE_HEADERS: &[&str] = &[
+        "x-client-request-id",
+        "session_id",
+        "conversation_id",
+        "x-session-id",
+        "session-id",
+        "conversation-id",
+        "conversationid",
+        "sessionid",
+    ];
+
+    CANDIDATE_HEADERS.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn set_prompt_cache_headers(headers: &mut HeaderMap, prompt_cache_key: &str) {
+    if prompt_cache_key.is_empty() {
+        return;
+    }
+
+    insert_header_value(
+        headers,
+        "x-client-request-id".to_string(),
+        prompt_cache_key.to_string(),
+    );
+    insert_header_value(
+        headers,
+        "session_id".to_string(),
+        prompt_cache_key.to_string(),
+    );
 }
 
 async fn send_http_with_recovery(
@@ -1801,6 +1895,11 @@ fn prepare_upstream_http_request(
     body: Bytes,
 ) -> Result<PreparedUpstreamHttpRequest, AppError> {
     let mut headers = build_upstream_http_headers(client_headers, &auth)?;
+    let fallback_prompt_cache_key = resolve_session_key_from_headers(client_headers)
+        .unwrap_or_else(|| codex_prompt_cache_key(&credential.id));
+    let (body, prompt_cache_key) =
+        normalize_prompt_cache_key_for_request(client_headers, body, &fallback_prompt_cache_key)?;
+    set_prompt_cache_headers(&mut headers, &prompt_cache_key);
     let base_url = state.provider_base_url(credential);
     let body = maybe_compress_upstream_request_body(
         &mut headers,
@@ -1909,10 +2008,15 @@ fn build_upstream_ws_request(
     client_headers: &HeaderMap,
     auth: &CodexAuth,
 ) -> Result<http::Request<()>, AppError> {
+    const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
+    const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
+
     let url = upstream_websocket_url(&upstream_http_url(state, credential, "/responses"))?;
     let mut request = url
         .into_client_request()
         .map_err(|err| AppError::bad_request(err.to_string()))?;
+    let prompt_cache_key = resolve_session_key_from_headers(client_headers)
+        .unwrap_or_else(|| codex_prompt_cache_key(&credential.id));
     {
         let headers = request.headers_mut();
         for (name, value) in client_headers {
@@ -1922,6 +2026,10 @@ fn build_upstream_ws_request(
             let _ = headers.insert(name, value.clone());
         }
         insert_missing_default_http_headers(headers);
+        let _ = headers.insert(
+            OPENAI_BETA_HEADER,
+            http::HeaderValue::from_static(RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE),
+        );
         let bearer = auth
             .get_token()
             .map_err(|err| AppError::service_unavailable(err.to_string()))?;
@@ -1933,6 +2041,7 @@ fn build_upstream_ws_request(
                 .map_err(|err| AppError::bad_request(err.to_string()))?;
             let _ = headers.insert("ChatGPT-Account-ID", header);
         }
+        set_prompt_cache_headers(headers, &prompt_cache_key);
     }
     Ok(request)
 }
@@ -2536,6 +2645,131 @@ mod tests {
         assert!(!should_skip_request_header("x-codex-turn-state"));
         assert!(should_skip_ws_request_header("sec-websocket-key"));
         assert!(!should_skip_ws_request_header("sec-websocket-protocol"));
+    }
+
+    #[test]
+    fn codex_prompt_cache_key_is_stable_and_distinct() {
+        let first = codex_prompt_cache_key("credential-1");
+        let second = codex_prompt_cache_key("credential-1");
+        let other = codex_prompt_cache_key("credential-2");
+
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn normalize_prompt_cache_key_injects_fallback_for_missing_and_blank_values() {
+        let fallback = codex_prompt_cache_key("credential-3");
+
+        let missing = br#"{"model":"gpt-5","stream":true}"#;
+        let (normalized_missing, key_missing) =
+            normalize_prompt_cache_key(missing, &fallback).expect("missing key should normalize");
+        assert_eq!(key_missing, fallback);
+        let missing_json: Value = serde_json::from_slice(&normalized_missing)
+            .expect("normalized body should remain valid JSON");
+        assert_eq!(missing_json["prompt_cache_key"], fallback);
+
+        let blank = br#"{"model":"gpt-5","prompt_cache_key":""}"#;
+        let (normalized_blank, key_blank) =
+            normalize_prompt_cache_key(blank, &fallback).expect("blank key should normalize");
+        assert_eq!(key_blank, fallback);
+        let blank_json: Value = serde_json::from_slice(&normalized_blank)
+            .expect("normalized body should remain valid JSON");
+        assert_eq!(blank_json["prompt_cache_key"], fallback);
+    }
+
+    #[test]
+    fn normalize_prompt_cache_key_for_request_reencodes_zstd_bodies() {
+        let fallback = codex_prompt_cache_key("credential-5");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_ENCODING,
+            http::HeaderValue::from_static("zstd"),
+        );
+        let original = br#"{"model":"gpt-5","stream":true}"#;
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(original.as_slice()), 3)
+            .expect("zstd compression should succeed");
+
+        let (normalized, key) = normalize_prompt_cache_key_for_request(
+            &headers,
+            Bytes::from(compressed.clone()),
+            &fallback,
+        )
+        .expect("zstd body should normalize");
+
+        assert_eq!(key, fallback);
+        assert_ne!(normalized.as_ref(), compressed.as_slice());
+
+        let decoded = zstd::stream::decode_all(std::io::Cursor::new(normalized.as_ref()))
+            .expect("normalized zstd body should decode");
+        let normalized_json: Value =
+            serde_json::from_slice(&decoded).expect("normalized body should remain valid JSON");
+        assert_eq!(normalized_json["prompt_cache_key"], fallback);
+    }
+
+    #[test]
+    fn normalize_prompt_cache_key_preserves_existing_value_and_headers_follow_it() {
+        let fallback = codex_prompt_cache_key("credential-4");
+        let existing = br#"{"model":"gpt-5","prompt_cache_key":"custom-cache-key"}"#;
+
+        let (normalized, key) =
+            normalize_prompt_cache_key(existing, &fallback).expect("existing key should normalize");
+        assert_eq!(normalized, existing);
+        assert_eq!(key, "custom-cache-key");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-client-request-id",
+            http::HeaderValue::from_static("old-request-id"),
+        );
+        headers.insert(
+            "session_id",
+            http::HeaderValue::from_static("old-session-id"),
+        );
+        set_prompt_cache_headers(&mut headers, &key);
+
+        assert_eq!(
+            headers
+                .get("x-client-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("custom-cache-key")
+        );
+        assert_eq!(
+            headers
+                .get("session_id")
+                .and_then(|value| value.to_str().ok()),
+            Some("custom-cache-key")
+        );
+    }
+
+    #[test]
+    fn session_key_resolution_prefers_client_request_id_then_session_aliases() {
+        let mut headers = HeaderMap::new();
+        headers.insert("session_id", http::HeaderValue::from_static("session-only"));
+        assert_eq!(
+            resolve_session_key_from_headers(&headers).as_deref(),
+            Some("session-only")
+        );
+
+        headers.insert(
+            "x-client-request-id",
+            http::HeaderValue::from_static("client-priority"),
+        );
+        assert_eq!(
+            resolve_session_key_from_headers(&headers).as_deref(),
+            Some("client-priority")
+        );
+
+        headers.remove("x-client-request-id");
+        headers.remove("session_id");
+        headers.insert(
+            "conversation_id",
+            http::HeaderValue::from_static("conversation-fallback"),
+        );
+        assert_eq!(
+            resolve_session_key_from_headers(&headers).as_deref(),
+            Some("conversation-fallback")
+        );
     }
 
     #[test]

@@ -557,19 +557,34 @@ impl AppState {
                 .await?;
         }
         if !headers.is_empty() {
-            let existing = credential::Entity::find_by_id(credential_id.to_string())
-                .one(self.db())
-                .await
-                .map_err(|err| AppError::internal(err.to_string()))?
-                .ok_or_else(|| AppError::not_found("credential not found"))?;
-            let mut active = credential::ActiveModel::from(existing);
-            active.last_limit_sync_at = Set(Some(Utc::now()));
-            active.updated_at = Set(Utc::now());
-            active
-                .update(self.db())
-                .await
-                .map_err(|err| AppError::internal(err.to_string()))?;
+            self.mark_limit_sync_now(credential_id).await?;
         }
+        Ok(())
+    }
+
+    pub async fn update_rate_limit_snapshot(
+        &self,
+        credential_id: &str,
+        snapshot: codex_protocol::protocol::RateLimitSnapshot,
+    ) -> Result<(), AppError> {
+        self.persist_rate_limit_snapshot(credential_id, snapshot)
+            .await?;
+        self.mark_limit_sync_now(credential_id).await
+    }
+
+    async fn mark_limit_sync_now(&self, credential_id: &str) -> Result<(), AppError> {
+        let existing = credential::Entity::find_by_id(credential_id.to_string())
+            .one(self.db())
+            .await
+            .map_err(|err| AppError::internal(err.to_string()))?
+            .ok_or_else(|| AppError::not_found("credential not found"))?;
+        let mut active = credential::ActiveModel::from(existing);
+        active.last_limit_sync_at = Set(Some(Utc::now()));
+        active.updated_at = Set(Utc::now());
+        active
+            .update(self.db())
+            .await
+            .map_err(|err| AppError::internal(err.to_string()))?;
         Ok(())
     }
 
