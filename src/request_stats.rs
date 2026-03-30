@@ -247,6 +247,10 @@ impl RequestObservation {
         self.mark_failure(error_phase, error_code, error_message, upstream_status_code);
     }
 
+    pub fn is_terminal(&self) -> bool {
+        self.success.is_some()
+    }
+
     pub fn finish_http_response(mut self, status: StatusCode) -> RequestRecordFinalization {
         self.upstream_status_code = Some(i32::from(status.as_u16()));
         if self.success.is_none() {
@@ -800,6 +804,8 @@ fn extract_error_message(value: &Value) -> Option<String> {
 fn extract_status_code(value: &Value) -> Option<i32> {
     value
         .get("status")
+        .or_else(|| value.get("status_code"))
+        .or_else(|| response_container(value).get("status_code"))
         .and_then(Value::as_i64)
         .and_then(|status| i32::try_from(status).ok())
 }
@@ -810,4 +816,28 @@ fn extract_incomplete_reason(value: &Value) -> Option<String> {
         .and_then(|details| details.get("reason"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn wrapped_websocket_error_status_code_is_recorded() {
+        let mut observation = RequestObservation::new(None);
+        observation.observe_json_value(&json!({
+            "type": "error",
+            "status_code": 401,
+            "error": {
+                "code": "invalid_api_key",
+                "message": "bad auth"
+            }
+        }));
+
+        let finalization = observation.finalize();
+        assert_eq!(finalization.upstream_status_code, Some(401));
+        assert!(!finalization.request_success);
+        assert_eq!(finalization.error_code.as_deref(), Some("invalid_api_key"));
+    }
 }

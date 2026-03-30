@@ -1,8 +1,10 @@
 import { apiRequest, type ApiContext } from '@/api/client'
 import type {
+  AdminLoginPayload,
+  AdminLoginResponse,
+  AdminSessionView,
   ApiKeyView,
   AuthSessionView,
-  CompleteBrowserAuthPayload,
   CreateApiKeyPayload,
   CreateApiKeyResponse,
   CreateCredentialPayload,
@@ -20,6 +22,20 @@ import type {
 export const api = {
   health(context: ApiContext) {
     return apiRequest<HealthResponse>(context, '/healthz')
+  },
+  loginAdminSession(context: ApiContext, payload: AdminLoginPayload) {
+    return apiRequest<AdminLoginResponse>(context, '/admin/session/login', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  getAdminSession(context: ApiContext) {
+    return apiRequest<AdminSessionView>(context, '/admin/session')
+  },
+  logoutAdminSession(context: ApiContext) {
+    return apiRequest<void>(context, '/admin/session/logout', {
+      method: 'POST',
+    })
   },
   listCredentials(context: ApiContext) {
     return apiRequest<CredentialView[]>(context, '/admin/credentials')
@@ -49,14 +65,11 @@ export const api = {
   listAuthSessions(context: ApiContext) {
     return apiRequest<AuthSessionView[]>(context, '/admin/auth/sessions')
   },
+  getAuthSession(context: ApiContext, authSessionId: string) {
+    return apiRequest<AuthSessionView>(context, `/admin/auth/sessions/${authSessionId}`)
+  },
   startBrowserAuth(context: ApiContext, payload: StartBrowserAuthPayload) {
     return apiRequest<AuthSessionView>(context, '/admin/auth/browser', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    })
-  },
-  completeBrowserAuth(context: ApiContext, authSessionId: string, payload: CompleteBrowserAuthPayload) {
-    return apiRequest<AuthSessionView>(context, `/admin/auth/browser/${authSessionId}/complete`, {
       method: 'POST',
       body: JSON.stringify(payload),
     })

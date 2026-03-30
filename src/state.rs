@@ -10,8 +10,12 @@ use codex_api::rate_limits::parse_all_rate_limits;
 use codex_login::AuthCredentialsStoreMode;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_login::default_client::build_reqwest_client;
 use codex_login::load_auth_dot_json;
+use codex_login::token_data::parse_jwt_expiration;
 use http::HeaderMap;
+use rand::RngExt;
+use rand::distr::Alphanumeric;
 use sea_orm::ActiveModelTrait;
 use sea_orm::ColumnTrait;
 use sea_orm::ConnectionTrait;
@@ -42,8 +46,23 @@ struct AppStateInner {
     db: DatabaseConnection,
     http_client: reqwest::Client,
     auth_managers: RwLock<HashMap<String, Arc<AuthManager>>>,
+    admin_sessions: Mutex<HashMap<String, AdminSessionRecord>>,
     active_requests: Mutex<HashMap<String, usize>>,
     auth_cancellations: Mutex<HashMap<String, CancellationToken>>,
+}
+
+#[derive(Clone)]
+struct AdminSessionRecord {
+    created_at: DateTime<Utc>,
+    last_used_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
+pub struct CreatedAdminSession {
+    pub session_token: String,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone)]
@@ -51,22 +70,27 @@ pub struct AuthenticatedPrincipal {
     pub principal_kind: AuthenticatedPrincipalKind,
     pub api_key_id: Option<String>,
     pub api_key_name: Option<String>,
+    pub admin_session_created_at: Option<DateTime<Utc>>,
+    pub admin_session_last_used_at: Option<DateTime<Utc>>,
+    pub admin_session_expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthenticatedPrincipalKind {
-    AdminToken,
+    AdminSession,
     ApiKey,
 }
 
 impl AuthenticatedPrincipalKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::AdminToken => "admin_token",
+            Self::AdminSession => "admin_session",
             Self::ApiKey => "api_key",
         }
     }
 }
+
+const ADMIN_SESSION_TTL_DAYS: i64 = 30;
 
 pub struct SelectedCredential {
     pub model: credential::Model,
@@ -101,9 +125,7 @@ impl AppState {
         initialize_database(&db).await?;
         recover_auth_sessions(&db).await?;
 
-        let http_client = reqwest::Client::builder()
-            .build()
-            .map_err(|err| AppError::internal(err.to_string()))?;
+        let http_client = build_reqwest_client();
 
         Ok(Self {
             inner: Arc::new(AppStateInner {
@@ -111,6 +133,7 @@ impl AppState {
                 db,
                 http_client,
                 auth_managers: RwLock::new(HashMap::new()),
+                admin_sessions: Mutex::new(HashMap::new()),
                 active_requests: Mutex::new(HashMap::new()),
                 auth_cancellations: Mutex::new(HashMap::new()),
             }),
@@ -216,6 +239,7 @@ impl AppState {
             /* enable_codex_api_key_env */ false,
             AuthCredentialsStoreMode::File,
         );
+        manager.set_forced_chatgpt_workspace_id(self.config().forced_chatgpt_workspace_id.clone());
 
         if let Ok(mut guard) = self.inner.auth_managers.write() {
             guard.insert(credential_id.to_string(), Arc::clone(&manager));
@@ -224,16 +248,61 @@ impl AppState {
         manager
     }
 
-    pub async fn authenticate_api_key(
+    pub fn verify_admin_password(&self, password: &str) -> bool {
+        hash_secret(password) == self.config().admin_password_hash
+    }
+
+    pub fn create_admin_session(&self) -> CreatedAdminSession {
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::days(ADMIN_SESSION_TTL_DAYS);
+        let session_token = generate_session_token();
+        let session_key = hash_secret(&session_token);
+        let record = AdminSessionRecord {
+            created_at: now,
+            last_used_at: now,
+            expires_at,
+        };
+
+        if let Ok(mut guard) = self.inner.admin_sessions.lock() {
+            retain_active_admin_sessions(&mut guard, now);
+            guard.insert(session_key, record.clone());
+        }
+
+        CreatedAdminSession {
+            session_token,
+            created_at: record.created_at,
+            last_used_at: record.last_used_at,
+            expires_at: record.expires_at,
+        }
+    }
+
+    pub fn revoke_admin_session(&self, session_token: &str) -> bool {
+        let now = Utc::now();
+        self.inner
+            .admin_sessions
+            .lock()
+            .ok()
+            .map(|mut guard| {
+                retain_active_admin_sessions(&mut guard, now);
+                guard.remove(&hash_secret(session_token)).is_some()
+            })
+            .unwrap_or(false)
+    }
+
+    pub async fn authenticate_bearer(
         &self,
         bearer: &str,
         require_admin: bool,
+        allow_admin_session: bool,
     ) -> Result<AuthenticatedPrincipal, AppError> {
-        if bearer == self.config().admin_token {
+        if allow_admin_session && let Some(record) = self.authenticate_admin_session_token(bearer) {
             return Ok(AuthenticatedPrincipal {
-                principal_kind: AuthenticatedPrincipalKind::AdminToken,
+                principal_kind: AuthenticatedPrincipalKind::AdminSession,
                 api_key_id: None,
                 api_key_name: None,
+                admin_session_created_at: Some(record.created_at),
+                admin_session_last_used_at: Some(record.last_used_at),
+                admin_session_expires_at: Some(record.expires_at),
             });
         }
 
@@ -271,7 +340,20 @@ impl AppState {
             principal_kind: AuthenticatedPrincipalKind::ApiKey,
             api_key_id: Some(api_key_id),
             api_key_name: Some(api_key_name),
+            admin_session_created_at: None,
+            admin_session_last_used_at: None,
+            admin_session_expires_at: None,
         })
+    }
+
+    fn authenticate_admin_session_token(&self, session_token: &str) -> Option<AdminSessionRecord> {
+        let now = Utc::now();
+        let session_key = hash_secret(session_token);
+        let mut guard = self.inner.admin_sessions.lock().ok()?;
+        retain_active_admin_sessions(&mut guard, now);
+        let record = guard.get_mut(&session_key)?;
+        record.last_used_at = now;
+        Some(record.clone())
     }
 
     pub async fn select_credential(
@@ -350,11 +432,11 @@ impl AppState {
     }
 
     async fn credential_has_active_auth(&self, credential_id: &str) -> bool {
-        self.auth_manager(credential_id)
-            .await
-            .auth()
-            .await
-            .is_some()
+        let manager = self.auth_manager(credential_id).await;
+        let Some(auth) = manager.auth().await else {
+            return false;
+        };
+        !auth_requires_reauthentication(&manager, &auth)
     }
 
     pub async fn sync_credential_from_auth(
@@ -387,8 +469,17 @@ impl AppState {
             .as_ref()
             .and_then(|tokens| tokens.id_token.get_chatgpt_plan_type_raw());
         let last_refresh_at = auth_dot_json.and_then(|payload| payload.last_refresh);
+        let should_auto_name = (existing.account_email.is_none() && existing.account_id.is_none())
+            || existing.name.starts_with("importing-");
+        let derived_name = account_email
+            .clone()
+            .or_else(|| account_id.clone())
+            .unwrap_or_else(|| existing.name.clone());
 
         let mut active = credential::ActiveModel::from(existing);
+        if should_auto_name {
+            active.name = Set(derived_name);
+        }
         active.account_id = Set(account_id);
         active.account_email = Set(account_email);
         active.plan_type = Set(plan_type);
@@ -562,6 +653,21 @@ fn unix_to_utc(timestamp: Option<i64>) -> Option<DateTime<Utc>> {
     timestamp.and_then(|value| DateTime::<Utc>::from_timestamp(value, 0))
 }
 
+fn auth_requires_reauthentication(manager: &AuthManager, auth: &CodexAuth) -> bool {
+    if !auth.is_chatgpt_auth() || manager.refresh_failure_for_auth(auth).is_none() {
+        return false;
+    }
+
+    let Ok(token_data) = auth.get_token_data() else {
+        return true;
+    };
+
+    match parse_jwt_expiration(&token_data.access_token) {
+        Ok(Some(expires_at)) => expires_at <= Utc::now(),
+        Ok(None) | Err(_) => true,
+    }
+}
+
 fn score_credential(
     model: &credential::Model,
     limits: &[credential_limit::Model],
@@ -605,6 +711,10 @@ fn limit_remaining_percent(limit: &credential_limit::Model) -> f64 {
 }
 
 pub fn hash_api_key(key: &str) -> String {
+    hash_secret(key)
+}
+
+fn hash_secret(key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
     hasher
@@ -612,6 +722,22 @@ pub fn hash_api_key(key: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn generate_session_token() -> String {
+    let suffix = rand::rng()
+        .sample_iter(Alphanumeric)
+        .take(40)
+        .map(char::from)
+        .collect::<String>();
+    format!("cps_{suffix}")
+}
+
+fn retain_active_admin_sessions(
+    sessions: &mut HashMap<String, AdminSessionRecord>,
+    now: DateTime<Utc>,
+) {
+    sessions.retain(|_, record| record.expires_at > now);
 }
 
 fn extract_token_flags(auth: Option<CodexAuth>) -> (bool, bool) {

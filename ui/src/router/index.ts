@@ -47,6 +47,14 @@ const router = createRouter({
         label: '请求记录',
       },
     },
+    {
+      path: '/auth/callback',
+      name: 'auth-callback',
+      component: () => import('@/views/AuthCallbackView.vue'),
+      meta: {
+        label: 'Auth 回调',
+      },
+    },
   ],
 })
 

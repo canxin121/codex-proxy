@@ -2,6 +2,24 @@ export interface HealthResponse {
   status: string
 }
 
+export interface AdminSessionView {
+  principal_kind: 'admin_session' | 'api_key'
+  api_key_id: string | null
+  api_key_name: string | null
+  admin_session_created_at: string | null
+  admin_session_last_used_at: string | null
+  admin_session_expires_at: string | null
+}
+
+export interface AdminLoginPayload {
+  admin_password: string
+}
+
+export interface AdminLoginResponse {
+  admin_session_token: string
+  admin_session: AdminSessionView
+}
+
 export interface RequestUsageTotalsView {
   read_input_tokens: number
   cache_read_input_tokens: number
@@ -155,13 +173,7 @@ export interface StatsOverviewView {
   latest_request_errors: LastRequestErrorView[]
 }
 
-export interface CreateCredentialPayload {
-  credential_name: string
-  is_enabled?: boolean
-  load_balance_weight?: number
-  credential_notes?: string | null
-  upstream_base_url?: string | null
-}
+export interface CreateCredentialPayload {}
 
 export interface UpdateCredentialPayload {
   credential_name?: string
@@ -173,10 +185,6 @@ export interface UpdateCredentialPayload {
 
 export interface StartBrowserAuthPayload {
   credential_id: string
-}
-
-export interface CompleteBrowserAuthPayload {
-  callback_url: string
 }
 
 export interface StartDeviceCodeAuthPayload {

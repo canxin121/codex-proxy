@@ -14,17 +14,17 @@ import {
 
 const props = defineProps<{
   baseUrl: string
-  adminToken: string
   autoRefresh: boolean
   pollIntervalSeconds: number
   submitting?: boolean
+  errorMessage?: string
 }>()
 
 const emit = defineEmits<{
   submit: [
     {
       baseUrl: string
-      adminToken: string
+      adminPassword: string
       autoRefresh: boolean
       pollIntervalSeconds: number
     },
@@ -33,7 +33,7 @@ const emit = defineEmits<{
 
 const form = reactive({
   baseUrl: props.baseUrl,
-  adminToken: props.adminToken,
+  adminPassword: '',
   autoRefresh: props.autoRefresh,
   pollIntervalSeconds: props.pollIntervalSeconds,
 })
@@ -42,7 +42,6 @@ watch(
   () => props,
   (value) => {
     form.baseUrl = value.baseUrl
-    form.adminToken = value.adminToken
     form.autoRefresh = value.autoRefresh
     form.pollIntervalSeconds = value.pollIntervalSeconds
   },
@@ -52,7 +51,7 @@ watch(
 function handleSubmit() {
   emit('submit', {
     baseUrl: form.baseUrl.trim(),
-    adminToken: form.adminToken.trim(),
+    adminPassword: form.adminPassword,
     autoRefresh: form.autoRefresh,
     pollIntervalSeconds: form.pollIntervalSeconds,
   })
@@ -67,11 +66,15 @@ function handleSubmit() {
       <div class="gate-kicker">Codex Proxy</div>
       <h1 class="gate-title display-font">一处控制台，管所有认证与流量</h1>
       <p class="gate-subtitle">
-        输入后端地址和 admin token 后，前端会接管凭证、Auth、API key、统计和请求记录全部管理能力。
+        输入后端地址和管理密码后，前端会向后端登录并换取管理会话，随后接管凭证、Auth、API key、统计和请求记录全部管理能力。
       </p>
 
       <n-alert type="info" :show-icon="false" class="gate-alert">
         默认同源访问即可。如果前端单独开发运行，把后端地址改成实际监听地址。
+      </n-alert>
+
+      <n-alert v-if="errorMessage" type="error" :show-icon="false" class="gate-alert">
+        {{ errorMessage }}
       </n-alert>
 
       <n-form label-placement="top" class="gate-form">
@@ -82,12 +85,12 @@ function handleSubmit() {
             clearable
           />
         </n-form-item>
-        <n-form-item label="Admin Token">
+        <n-form-item label="管理密码">
           <n-input
-            v-model:value="form.adminToken"
+            v-model:value="form.adminPassword"
             type="password"
             show-password-on="click"
-            placeholder="cpa_xxxxxxxxxxxxxxxx"
+            placeholder="启动服务时传入的密码"
           />
         </n-form-item>
         <n-space size="large" wrap>
@@ -108,7 +111,7 @@ function handleSubmit() {
           size="large"
           block
           :loading="submitting"
-          :disabled="!form.baseUrl.trim() || !form.adminToken.trim()"
+          :disabled="!form.baseUrl.trim() || !form.adminPassword.trim()"
           @click="handleSubmit"
         >
           进入控制台

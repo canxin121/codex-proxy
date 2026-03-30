@@ -10,6 +10,7 @@ async-stream = "0.3.6"
 axum = { version = "0.8.8", default-features = false, features = ["http1", "json", "macros", "query", "tokio", "ws"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.44", features = ["serde"] }
+codex-client = { path = "vendor/codex/codex-rs/codex-client" }
 clap = { version = "4.6.0", features = ["derive", "env"] }
 codex-api = { path = "vendor/codex/codex-rs/codex-api" }
 codex-login = { path = "vendor/codex/codex-rs/login" }
@@ -17,7 +18,7 @@ codex-protocol = { path = "vendor/codex/codex-rs/protocol" }
 futures = { version = "0.3.32", default-features = false }
 http = "1.4.0"
 rand = "0.10.0"
-reqwest = { version = "0.13.2", features = ["json", "stream", "rustls"] }
+reqwest = { version = "0.12.28", features = ["json", "stream", "rustls-tls"] }
 sea-orm = { version = "1.1.19", default-features = false, features = [
     "macros",
     "runtime-tokio-rustls",
@@ -30,13 +31,15 @@ sha2 = "0.11.0"
 thiserror = "2.0.18"
 tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-util = "0.7.18"
-tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
 tower-http = { version = "0.6.8", features = ["fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tungstenite = { version = "0.27.0", features = ["deflate", "proxy"] }
 url = "2.5.8"
 urlencoding = "2.1.3"
 uuid = { version = "1.23.0", features = ["serde", "v4"] }
+zstd = "0.13.3"
 
 [patch.crates-io]
 tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "132f5b39c862e3a970f731d709608b3e6276d5f6" }

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import {
+  NAlert,
   NButton,
   NCard,
   NEmpty,
@@ -20,6 +21,13 @@ import { api } from '@/api/service'
 import type { AuthSessionView, CredentialView } from '@/api/types'
 import { useAutoRefresh } from '@/composables/use-auto-refresh'
 import { useSessionStore } from '@/stores/session'
+import {
+  expectedBrowserAuthApiCallbackUrl,
+  forgetPendingBrowserAuthSession,
+  normalizeComparableUrl,
+  rememberPendingBrowserAuthSession,
+  syncPendingBrowserAuthSessions,
+} from '@/utils/browser-auth'
 import { formatDateTime, formatRelativeShort } from '@/utils/format'
 import { copyText } from '@/utils/copy'
 
@@ -37,7 +45,11 @@ const credentialFilter = ref<string | null>(null)
 const searchKeyword = ref('')
 const showCompleteModal = ref(false)
 const completingSession = ref<AuthSessionView | null>(null)
-const callbackUrl = ref('')
+const browserAuthApiCallbackUrl = computed(() => expectedBrowserAuthApiCallbackUrl())
+const completingSessionAutoReady = computed(() =>
+  normalizeComparableUrl(completingSession.value?.auth_redirect_url)
+  === normalizeComparableUrl(browserAuthApiCallbackUrl.value),
+)
 
 const filteredSessions = computed(() => {
   const keyword = searchKeyword.value.trim().toLowerCase()
@@ -75,7 +87,7 @@ const credentialOptions = computed(() =>
 )
 
 async function load() {
-  if (!session.hasAdminToken) {
+  if (!session.hasAdminSession) {
     return
   }
   loading.value = true
@@ -87,6 +99,10 @@ async function load() {
     ])
     sessions.value = sessionResponse
     credentials.value = credentialResponse
+    syncPendingBrowserAuthSessions(
+      sessionResponse,
+      new Map(credentialResponse.map((item) => [item.credential_id, item.credential_name])),
+    )
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   } finally {
@@ -97,6 +113,9 @@ async function load() {
 async function cancelSession(item: AuthSessionView) {
   try {
     await api.cancelAuthSession(session.apiContext, item.auth_session_id)
+    if (item.auth_method === 'browser') {
+      forgetPendingBrowserAuthSession(item.auth_session_id)
+    }
     message.success('会话已取消')
     await load()
   } catch (error) {
@@ -127,30 +146,16 @@ async function copy(value?: string | null, successText = '已复制') {
 }
 
 function openCompleteModal(item: AuthSessionView) {
+  const credentialName =
+    credentials.value.find((credential) => credential.credential_id === item.credential_id)?.credential_name ?? null
+  rememberPendingBrowserAuthSession(item, credentialName)
   completingSession.value = item
-  callbackUrl.value = ''
   showCompleteModal.value = true
-}
-
-async function completeBrowserAuth() {
-  if (!completingSession.value) {
-    return
-  }
-  try {
-    await api.completeBrowserAuth(session.apiContext, completingSession.value.auth_session_id, {
-      callback_url: callbackUrl.value.trim(),
-    })
-    message.success('Browser Auth 已完成')
-    showCompleteModal.value = false
-    await load()
-  } catch (error) {
-    message.error(error instanceof Error ? error.message : String(error))
-  }
 }
 
 useAutoRefresh(
   load,
-  computed(() => session.hasAdminToken && (session.autoRefresh || hasPendingSession.value)),
+  computed(() => session.hasAdminSession && (session.autoRefresh || hasPendingSession.value)),
   computed(() => session.pollIntervalSeconds * 1000),
 )
 
@@ -319,7 +324,7 @@ onMounted(() => {
                     size="small"
                     @click="openCompleteModal(item)"
                   >
-                    提交回调
+                    继续登录
                   </n-button>
                   <n-button
                     v-if="item.verification_url"
@@ -370,13 +375,30 @@ onMounted(() => {
       v-model:show="showCompleteModal"
       preset="card"
       style="width: min(760px, 96vw)"
-      title="完成 Browser Auth"
+      title="Browser Auth 进行中"
     >
       <template v-if="completingSession">
         <n-space vertical size="large">
+          <n-alert
+            v-if="completingSessionAutoReady"
+            type="success"
+            :show-icon="false"
+          >
+            当前 Browser Auth 会在登录完成后自动回到控制台的
+            <span class="mono">{{ completingSession.auth_redirect_url }}</span>
+            ，后端会直接处理 OAuth callback，不需要手工提交任何 URL。
+          </n-alert>
+          <n-alert v-else type="warning" :show-icon="false">
+            当前服务返回的 Auth Callback 不是预期的同域 API 地址：
+            <span class="mono">{{ browserAuthApiCallbackUrl }}</span>
+            。这通常意味着反向代理头没有正确透传；必要时可以显式配置
+            <span class="mono">CODEX_PROXY_PUBLIC_BASE_URL</span>
+            。
+          </n-alert>
+
           <n-thing title="1. 完成登录">
             <template #description>
-              打开授权页完成登录，浏览器跳转到 callback URL 后，把地址栏的完整地址粘贴回来。
+              打开授权页完成登录。登录成功后，浏览器会先回到后端的同域 callback API，再自动跳回控制台结果页。
             </template>
             <n-space wrap>
               <n-button
@@ -396,23 +418,11 @@ onMounted(() => {
               </n-button>
             </n-space>
           </n-thing>
-
-          <n-thing title="2. 粘贴完整 callback URL">
-            <n-input
-              v-model:value="callbackUrl"
-              type="textarea"
-              :rows="4"
-              placeholder="http://localhost:1455/auth/callback?code=...&state=..."
-            />
-          </n-thing>
         </n-space>
       </template>
       <template #action>
         <n-space justify="end">
           <n-button @click="showCompleteModal = false">关闭</n-button>
-          <n-button type="primary" :disabled="!callbackUrl.trim()" @click="completeBrowserAuth">
-            提交回调
-          </n-button>
         </n-space>
       </template>
     </n-modal>

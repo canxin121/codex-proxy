@@ -1,7 +1,7 @@
 use clap::Parser;
 use codex_login::CLIENT_ID;
-use rand::RngExt;
-use rand::distr::Alphanumeric;
+use sha2::Digest;
+use sha2::Sha256;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -20,8 +20,8 @@ pub struct Args {
     #[arg(long, env = "CODEX_PROXY_DATABASE_URL")]
     pub database_url: Option<String>,
 
-    #[arg(long, env = "CODEX_PROXY_ADMIN_TOKEN")]
-    pub admin_token: Option<String>,
+    #[arg(long, env = "CODEX_PROXY_ADMIN_PASSWORD")]
+    pub admin_password: String,
 
     #[arg(
         long,
@@ -44,12 +44,8 @@ pub struct Args {
     )]
     pub auth_client_id: String,
 
-    #[arg(
-        long,
-        env = "CODEX_PROXY_AUTH_CALLBACK_URL",
-        default_value = "http://localhost:1455/auth/callback"
-    )]
-    pub auth_callback_url: String,
+    #[arg(long, env = "CODEX_PROXY_PUBLIC_BASE_URL")]
+    pub public_base_url: Option<String>,
 
     #[arg(long, env = "CODEX_PROXY_FORCED_CHATGPT_WORKSPACE_ID")]
     pub forced_chatgpt_workspace_id: Option<String>,
@@ -60,11 +56,11 @@ pub struct AppConfig {
     pub bind: SocketAddr,
     pub data_dir: PathBuf,
     pub database_url: String,
-    pub admin_token: String,
+    pub admin_password_hash: String,
     pub chatgpt_base_url: String,
     pub auth_issuer: String,
     pub auth_client_id: String,
-    pub auth_callback_url: String,
+    pub public_base_url: Option<String>,
     pub forced_chatgpt_workspace_id: Option<String>,
 }
 
@@ -79,27 +75,26 @@ impl Args {
             let db_path = data_dir.join("codex-proxy.sqlite");
             format!("sqlite://{}?mode=rwc", db_path.display())
         });
-        let admin_token = self.admin_token.unwrap_or_else(generate_admin_token);
-
         Ok(AppConfig {
             bind: self.bind,
             data_dir,
             database_url,
-            admin_token,
+            admin_password_hash: hash_secret(&self.admin_password),
             chatgpt_base_url: self.chatgpt_base_url,
             auth_issuer: self.auth_issuer,
             auth_client_id: self.auth_client_id,
-            auth_callback_url: self.auth_callback_url,
+            public_base_url: self.public_base_url,
             forced_chatgpt_workspace_id: self.forced_chatgpt_workspace_id,
         })
     }
 }
 
-fn generate_admin_token() -> String {
-    let suffix = rand::rng()
-        .sample_iter(Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect::<String>();
-    format!("cpa_{suffix}")
+fn hash_secret(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

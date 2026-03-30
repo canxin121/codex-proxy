@@ -66,7 +66,7 @@ const visibleSummary = computed(() => ({
 }))
 
 async function load() {
-  if (!session.hasAdminToken) {
+  if (!session.hasAdminSession) {
     return
   }
   loading.value = true
@@ -94,7 +94,7 @@ async function load() {
 
 useAutoRefresh(
   load,
-  computed(() => session.hasAdminToken && session.autoRefresh),
+  computed(() => session.hasAdminSession && session.autoRefresh),
   computed(() => session.pollIntervalSeconds * 1000),
 )
 

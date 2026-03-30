@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, h, onMounted, reactive, ref, watch } from 'vue'
-import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 import {
   BarChartOutline,
   FolderOpenOutline,
@@ -33,8 +33,6 @@ import {
   NSpace,
   NSwitch,
   NTag,
-  darkTheme,
-  useMessage,
 } from 'naive-ui'
 import type { MenuOption } from 'naive-ui'
 import AdminGate from '@/components/AdminGate.vue'
@@ -53,19 +51,18 @@ const showMobileNav = ref(false)
 const connecting = ref(false)
 const serviceHealthy = ref<boolean | null>(null)
 const lastHealthError = ref('')
+const loginError = ref('')
 
 const settingsForm = reactive({
   baseUrl: session.baseUrl,
-  adminToken: session.adminToken,
   autoRefresh: session.autoRefresh,
   pollIntervalSeconds: session.pollIntervalSeconds,
 })
 
 watch(
-  () => [session.baseUrl, session.adminToken, session.autoRefresh, session.pollIntervalSeconds] as const,
-  ([baseUrl, adminToken, autoRefresh, pollIntervalSeconds]) => {
+  () => [session.baseUrl, session.adminSessionToken, session.autoRefresh, session.pollIntervalSeconds] as const,
+  ([baseUrl, _adminSessionToken, autoRefresh, pollIntervalSeconds]) => {
     settingsForm.baseUrl = baseUrl
-    settingsForm.adminToken = adminToken
     settingsForm.autoRefresh = autoRefresh
     settingsForm.pollIntervalSeconds = pollIntervalSeconds
   },
@@ -105,6 +102,9 @@ const menuOptions = computed<MenuOption[]>(() => [
 const activeRouteName = computed(() => String(route.name ?? 'overview'))
 const currentSectionLabel = computed(() => {
   const matched = menuOptions.value.find((item) => item.key === activeRouteName.value)
+  if (typeof route.meta.label === 'string') {
+    return route.meta.label
+  }
   return typeof matched?.label === 'string' ? matched.label : '控制台'
 })
 
@@ -122,41 +122,82 @@ function renderIcon(icon: object) {
 
 async function handleLogin(payload: {
   baseUrl: string
-  adminToken: string
+  adminPassword: string
   autoRefresh: boolean
   pollIntervalSeconds: number
 }) {
   connecting.value = true
+  loginError.value = ''
   try {
-    session.updateSession(payload)
-    await verifyHealth()
+    const baseUrl = payload.baseUrl.trim()
+    const response = await api.loginAdminSession(
+      {
+        baseUrl,
+        adminSessionToken: '',
+      },
+      {
+        admin_password: payload.adminPassword,
+      },
+    )
+    session.updateSession({
+      baseUrl,
+      adminSessionToken: response.admin_session_token,
+      autoRefresh: payload.autoRefresh,
+      pollIntervalSeconds: payload.pollIntervalSeconds,
+    })
+    await verifyAdminSession()
+  } catch (error) {
+    session.updateSession({
+      baseUrl: payload.baseUrl.trim(),
+      adminSessionToken: '',
+      autoRefresh: payload.autoRefresh,
+      pollIntervalSeconds: payload.pollIntervalSeconds,
+    })
+    serviceHealthy.value = null
+    loginError.value = error instanceof ApiError ? error.message : String(error)
   } finally {
     connecting.value = false
   }
 }
 
 function applySettings() {
+  const nextBaseUrl = settingsForm.baseUrl.trim()
+  const baseUrlChanged = nextBaseUrl !== session.baseUrl.trim()
   session.updateSession({
-    baseUrl: settingsForm.baseUrl.trim(),
-    adminToken: settingsForm.adminToken.trim(),
+    baseUrl: nextBaseUrl,
+    adminSessionToken: baseUrlChanged ? '' : session.adminSessionToken,
     autoRefresh: settingsForm.autoRefresh,
     pollIntervalSeconds: settingsForm.pollIntervalSeconds,
   })
+  if (baseUrlChanged) {
+    serviceHealthy.value = null
+    loginError.value = ''
+  } else {
+    void verifyAdminSession()
+  }
   showSettings.value = false
 }
 
-async function verifyHealth() {
-  if (!session.hasAdminToken) {
+async function verifyAdminSession() {
+  if (!session.hasAdminSession) {
     serviceHealthy.value = null
     return
   }
   try {
-    await api.health(session.apiContext)
+    await api.getAdminSession(session.apiContext)
     serviceHealthy.value = true
     lastHealthError.value = ''
+    loginError.value = ''
   } catch (error) {
-    serviceHealthy.value = false
-    lastHealthError.value = error instanceof ApiError ? error.message : String(error)
+    const message = error instanceof ApiError ? error.message : String(error)
+    if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+      session.clearAdminSession()
+      serviceHealthy.value = null
+      loginError.value = message
+    } else {
+      serviceHealthy.value = false
+    }
+    lastHealthError.value = message
   }
 }
 
@@ -165,20 +206,27 @@ function handleMenuSelect(key: string) {
   showMobileNav.value = false
 }
 
-function handleLogout() {
-  session.clearToken()
+async function handleLogout() {
+  try {
+    if (session.hasAdminSession) {
+      await api.logoutAdminSession(session.apiContext)
+    }
+  } catch {}
+  session.clearAdminSession()
   showSettings.value = false
   showMobileNav.value = false
+  serviceHealthy.value = null
+  loginError.value = ''
 }
 
 useAutoRefresh(
-  verifyHealth,
-  computed(() => session.hasAdminToken && session.autoRefresh),
+  verifyAdminSession,
+  computed(() => session.hasAdminSession && session.autoRefresh),
   computed(() => session.pollIntervalSeconds * 1000),
 )
 
 onMounted(() => {
-  void verifyHealth()
+  void verifyAdminSession()
 })
 </script>
 
@@ -189,10 +237,10 @@ onMounted(() => {
       <n-notification-provider>
         <n-message-provider>
           <admin-gate
-            v-if="!session.hasAdminToken"
-            :admin-token="session.adminToken"
+            v-if="!session.hasAdminSession"
             :auto-refresh="session.autoRefresh"
             :base-url="session.baseUrl"
+            :error-message="loginError"
             :poll-interval-seconds="session.pollIntervalSeconds"
             :submitting="connecting"
             @submit="handleLogin"
@@ -294,13 +342,6 @@ onMounted(() => {
                   <n-form-item label="后端地址">
                     <n-input v-model:value="settingsForm.baseUrl" />
                   </n-form-item>
-                  <n-form-item label="Admin Token">
-                    <n-input
-                      v-model:value="settingsForm.adminToken"
-                      type="password"
-                      show-password-on="click"
-                    />
-                  </n-form-item>
                   <n-space size="large" vertical>
                     <n-form-item label="自动刷新">
                       <n-switch v-model:value="settingsForm.autoRefresh" />
@@ -316,6 +357,9 @@ onMounted(() => {
                   </n-space>
                   <p v-if="lastHealthError" class="settings-error">
                     {{ lastHealthError }}
+                  </p>
+                  <p class="settings-hint">
+                    更换后端地址后，当前管理会话会被清空，需要重新输入密码登录。
                   </p>
                   <n-space justify="end" style="margin-top: 24px">
                     <n-button @click="showSettings = false">取消</n-button>
@@ -437,6 +481,12 @@ onMounted(() => {
 
 .settings-error {
   color: var(--cp-danger);
+  line-height: 1.7;
+}
+
+.settings-hint {
+  margin: 0;
+  color: var(--cp-text-soft);
   line-height: 1.7;
 }
 

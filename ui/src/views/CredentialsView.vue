@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import {
+  NAlert,
   NButton,
   NCard,
   NDivider,
@@ -14,6 +15,8 @@ import {
   NInputNumber,
   NModal,
   NProgress,
+  NRadioButton,
+  NRadioGroup,
   NSkeleton,
   NSpace,
   NSwitch,
@@ -25,7 +28,6 @@ import {
 import {
   AddOutline,
   RefreshOutline,
-  LinkOutline,
   OpenOutline,
   TrashOutline,
   CreateOutline,
@@ -37,6 +39,12 @@ import { api } from '@/api/service'
 import type { AuthSessionView, CredentialView } from '@/api/types'
 import { useSessionStore } from '@/stores/session'
 import { useAutoRefresh } from '@/composables/use-auto-refresh'
+import {
+  expectedBrowserAuthApiCallbackUrl,
+  forgetPendingBrowserAuthSession,
+  normalizeComparableUrl,
+  rememberPendingBrowserAuthSession,
+} from '@/utils/browser-auth'
 import {
   formatDateTime,
   formatNumber,
@@ -56,11 +64,12 @@ const searchKeyword = ref('')
 const enabledOnly = ref(false)
 const showFormModal = ref(false)
 const editingCredential = ref<CredentialView | null>(null)
+const importAuthMethod = ref<'browser' | 'device_code'>('browser')
 const showBrowserModal = ref(false)
 const browserSession = ref<AuthSessionView | null>(null)
-const browserCallbackUrl = ref('')
 const showDeviceModal = ref(false)
 const deviceSession = ref<AuthSessionView | null>(null)
+const syncingTrackedSessions = ref(false)
 
 const form = reactive({
   credential_name: '',
@@ -104,6 +113,12 @@ const summary = computed(() => ({
   failures: credentials.value.reduce((sum, item) => sum + item.request_stats.failure_request_count, 0),
 }))
 
+const browserAuthApiCallbackUrl = computed(() => expectedBrowserAuthApiCallbackUrl())
+const browserAutoCallbackReady = computed(() =>
+  normalizeComparableUrl(browserSession.value?.auth_redirect_url)
+  === normalizeComparableUrl(browserAuthApiCallbackUrl.value),
+)
+
 function resetForm() {
   form.credential_name = ''
   form.is_enabled = true
@@ -114,7 +129,7 @@ function resetForm() {
 
 function openCreateModal() {
   editingCredential.value = null
-  resetForm()
+  importAuthMethod.value = 'browser'
   showFormModal.value = true
 }
 
@@ -129,17 +144,81 @@ function openEditModal(item: CredentialView) {
 }
 
 async function load() {
-  if (!session.hasAdminToken) {
+  if (!session.hasAdminSession) {
     return
   }
   loading.value = true
   errorMessage.value = ''
   try {
     credentials.value = await api.listCredentials(session.apiContext)
+    await syncTrackedAuthSessions()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   } finally {
     loading.value = false
+  }
+}
+
+async function syncTrackedSession(
+  current: AuthSessionView | null,
+  kind: 'browser' | 'device',
+): Promise<boolean> {
+  if (!current) {
+    return false
+  }
+  try {
+    const updated = await api.getAuthSession(session.apiContext, current.auth_session_id)
+    const previousStatus = current.auth_status
+    if (kind === 'browser') {
+      browserSession.value = updated
+      const credentialName =
+        credentials.value.find((item) => item.credential_id === updated.credential_id)?.credential_name ?? null
+      if (updated.auth_status === 'pending') {
+        rememberPendingBrowserAuthSession(updated, credentialName)
+      } else {
+        forgetPendingBrowserAuthSession(updated.auth_session_id)
+      }
+    } else {
+      deviceSession.value = updated
+    }
+
+    if (previousStatus === updated.auth_status) {
+      return false
+    }
+
+    if (updated.auth_status === 'completed') {
+      message.success(kind === 'browser' ? 'Browser Auth 已完成' : 'Device Code Auth 已完成')
+      return true
+    }
+    if (updated.auth_status === 'failed') {
+      message.error(updated.auth_error ?? (kind === 'browser' ? 'Browser Auth 失败' : 'Device Code Auth 失败'))
+      return true
+    }
+    if (updated.auth_status === 'cancelled') {
+      message.warning(kind === 'browser' ? 'Browser Auth 已取消' : 'Device Code Auth 已取消')
+      return true
+    }
+  } catch {
+    return false
+  }
+  return false
+}
+
+async function syncTrackedAuthSessions() {
+  if (syncingTrackedSessions.value || (!browserSession.value && !deviceSession.value)) {
+    return
+  }
+  syncingTrackedSessions.value = true
+  try {
+    const [browserChanged, deviceChanged] = await Promise.all([
+      syncTrackedSession(browserSession.value, 'browser'),
+      syncTrackedSession(deviceSession.value, 'device'),
+    ])
+    if (browserChanged || deviceChanged) {
+      credentials.value = await api.listCredentials(session.apiContext)
+    }
+  } finally {
+    syncingTrackedSessions.value = false
   }
 }
 
@@ -155,14 +234,14 @@ async function submitForm() {
       })
       message.success('凭证已更新')
     } else {
-      await api.createCredential(session.apiContext, {
-        credential_name: form.credential_name.trim(),
-        is_enabled: form.is_enabled,
-        load_balance_weight: form.load_balance_weight,
-        credential_notes: form.credential_notes.trim() || null,
-        upstream_base_url: form.upstream_base_url.trim() || null,
-      })
-      message.success('凭证已创建')
+      const created = await api.createCredential(session.apiContext, {})
+      showFormModal.value = false
+      if (importAuthMethod.value === 'browser') {
+        await startBrowserAuth(created)
+      } else {
+        await startDeviceAuth(created)
+      }
+      return
     }
     showFormModal.value = false
     await load()
@@ -204,26 +283,14 @@ async function startBrowserAuth(item: CredentialView) {
     const response = await api.startBrowserAuth(session.apiContext, {
       credential_id: item.credential_id,
     })
+    rememberPendingBrowserAuthSession(response, item.credential_name)
     browserSession.value = response
-    browserCallbackUrl.value = ''
     showBrowserModal.value = true
-    message.success('Browser Auth 会话已创建')
-    await load()
-  } catch (error) {
-    message.error(error instanceof Error ? error.message : String(error))
-  }
-}
-
-async function completeBrowserAuth() {
-  if (!browserSession.value) {
-    return
-  }
-  try {
-    await api.completeBrowserAuth(session.apiContext, browserSession.value.auth_session_id, {
-      callback_url: browserCallbackUrl.value.trim(),
-    })
-    message.success('Browser Auth 已完成')
-    showBrowserModal.value = false
+    message.success(
+      normalizeComparableUrl(response.auth_redirect_url) === normalizeComparableUrl(browserAuthApiCallbackUrl.value)
+        ? 'Browser Auth 会话已创建，完成登录后会自动回到当前 GUI 继续托管'
+        : 'Browser Auth 会话已创建',
+    )
     await load()
   } catch (error) {
     message.error(error instanceof Error ? error.message : String(error))
@@ -255,7 +322,7 @@ async function copy(value: string, successText = '已复制') {
 
 useAutoRefresh(
   load,
-  computed(() => session.hasAdminToken && session.autoRefresh),
+  computed(() => session.hasAdminSession && session.autoRefresh),
   computed(() => session.pollIntervalSeconds * 1000),
 )
 
@@ -271,7 +338,7 @@ onMounted(() => {
         <div class="page-kicker">Credential Pool</div>
         <h1 class="page-title display-font">凭证池、限额和认证入口</h1>
         <p class="page-subtitle">
-          这里负责管理上游 ChatGPT Auth 凭证。你可以直接创建、修改、刷新、删除凭证，也可以在卡片上发起 browser / device code Auth。
+          这里负责导入和管理上游 ChatGPT Auth 凭证。导入时不需要手工填写名称，完成登录后会自动用 Codex 账号信息命名并托管到服务中。
         </p>
       </div>
       <n-space wrap>
@@ -285,7 +352,7 @@ onMounted(() => {
           <template #icon>
             <n-icon><AddOutline /></n-icon>
           </template>
-          新建凭证
+          导入凭证
         </n-button>
       </n-space>
     </div>
@@ -341,9 +408,11 @@ onMounted(() => {
         <template #header>
           <div class="credential-card__header">
             <div>
-              <div class="credential-card__title">{{ item.credential_name }}</div>
+              <div class="credential-card__title">
+                {{ item.credential_has_auth ? item.credential_name : '等待导入认证' }}
+              </div>
               <div class="credential-card__subtitle">
-                {{ item.chatgpt_account_email ?? item.chatgpt_account_id ?? '未同步账号标识' }}
+                {{ item.chatgpt_account_email ?? item.chatgpt_account_id ?? '完成认证后会自动使用账号命名' }}
               </div>
             </div>
             <n-space size="small" wrap>
@@ -440,7 +509,7 @@ onMounted(() => {
               </n-button>
             </n-space>
             <n-space wrap>
-              <n-button tertiary size="small" @click="openEditModal(item)">
+              <n-button v-if="item.credential_has_auth" tertiary size="small" @click="openEditModal(item)">
                 <template #icon>
                   <n-icon><CreateOutline /></n-icon>
                 </template>
@@ -459,46 +528,92 @@ onMounted(() => {
     </div>
     <n-empty v-else description="没有匹配到任何凭证" class="empty-state app-shell-card" />
 
-    <n-modal v-model:show="showFormModal" preset="card" style="width: min(640px, 96vw)" :title="editingCredential ? '编辑凭证' : '新建凭证'">
-      <n-form label-placement="top">
-        <n-form-item label="凭证名称">
-          <n-input v-model:value="form.credential_name" placeholder="workspace-a" />
-        </n-form-item>
-        <n-grid cols="1 s:2" responsive="screen" :x-gap="14">
-          <n-grid-item>
-            <n-form-item label="启用">
-              <n-switch v-model:value="form.is_enabled" />
-            </n-form-item>
-          </n-grid-item>
-          <n-grid-item>
-            <n-form-item label="负载权重">
-              <n-input-number v-model:value="form.load_balance_weight" :min="1" :precision="0" />
-            </n-form-item>
-          </n-grid-item>
-        </n-grid>
-        <n-form-item label="上游 Base URL">
-          <n-input v-model:value="form.upstream_base_url" placeholder="可留空走默认 ChatGPT Codex URL" />
-        </n-form-item>
-        <n-form-item label="备注">
-          <n-input v-model:value="form.credential_notes" type="textarea" :rows="4" />
-        </n-form-item>
-      </n-form>
+    <n-modal v-model:show="showFormModal" preset="card" style="width: min(680px, 96vw)" :title="editingCredential ? '编辑凭证' : '导入凭证'">
+      <template v-if="editingCredential">
+        <n-form label-placement="top">
+          <n-form-item label="凭证名称">
+            <n-input v-model:value="form.credential_name" placeholder="账号显示名称" />
+          </n-form-item>
+          <n-grid cols="1 s:2" responsive="screen" :x-gap="14">
+            <n-grid-item>
+              <n-form-item label="启用">
+                <n-switch v-model:value="form.is_enabled" />
+              </n-form-item>
+            </n-grid-item>
+            <n-grid-item>
+              <n-form-item label="负载权重">
+                <n-input-number v-model:value="form.load_balance_weight" :min="1" :precision="0" />
+              </n-form-item>
+            </n-grid-item>
+          </n-grid>
+          <n-form-item label="上游 Base URL">
+            <n-input v-model:value="form.upstream_base_url" placeholder="可留空走默认 ChatGPT Codex URL" />
+          </n-form-item>
+          <n-form-item label="备注">
+            <n-input v-model:value="form.credential_notes" type="textarea" :rows="4" />
+          </n-form-item>
+        </n-form>
+      </template>
+      <template v-else>
+        <n-space vertical size="large">
+          <n-alert type="info" :show-icon="false">
+            导入时不需要填写凭证名称。系统会先创建一个导入记录，等你完成 Codex 登录后，自动用登录账号邮箱或账号 ID 作为凭证名称。
+          </n-alert>
+
+          <n-thing title="选择导入方式">
+            <template #description>
+              Browser Auth 适合当前浏览器直接完成登录。Device Code 适合在另一台设备或单独浏览器里输入 code。
+            </template>
+            <n-radio-group v-model:value="importAuthMethod">
+              <n-space vertical size="medium">
+                <n-radio-button value="browser">Browser Auth</n-radio-button>
+                <n-radio-button value="device_code">Device Code</n-radio-button>
+              </n-space>
+            </n-radio-group>
+          </n-thing>
+
+          <n-alert v-if="importAuthMethod === 'browser'" type="info" :show-icon="false">
+            Browser Auth 会直接使用当前控制台同域的后端 API 回调地址
+            <span class="mono">{{ browserAuthApiCallbackUrl }}</span>
+            。正常情况下不需要额外监听 localhost 端口；如果实际返回的回调地址不对，再检查反向代理头或配置
+            <span class="mono">CODEX_PROXY_PUBLIC_BASE_URL</span>
+            。
+          </n-alert>
+
+          <div class="import-method-panel">
+            <div class="import-method-panel__title">
+              {{ importAuthMethod === 'browser' ? 'Browser Auth' : 'Device Code' }}
+            </div>
+            <div class="import-method-panel__body">
+              {{
+                importAuthMethod === 'browser'
+                  ? '导入后会立刻生成授权链接。完成登录后，后端会在同域 callback API 里直接完成 code 交换、凭证落库，再跳回前端结果页。'
+                  : '导入后会立刻生成 verification URL 和 user code。你完成输入后，后端会后台轮询直到授权完成。'
+              }}
+            </div>
+          </div>
+        </n-space>
+      </template>
       <template #action>
         <n-space justify="end">
           <n-button @click="showFormModal = false">取消</n-button>
-          <n-button type="primary" :disabled="!form.credential_name.trim()" @click="submitForm">
-            {{ editingCredential ? '保存修改' : '创建凭证' }}
+          <n-button
+            type="primary"
+            :disabled="editingCredential ? !form.credential_name.trim() : false"
+            @click="submitForm"
+          >
+            {{ editingCredential ? '保存修改' : importAuthMethod === 'browser' ? '开始 Browser Auth 导入' : '开始 Device Code 导入' }}
           </n-button>
         </n-space>
       </template>
     </n-modal>
 
-    <n-modal v-model:show="showBrowserModal" preset="card" style="width: min(760px, 96vw)" title="完成 Browser Auth">
+    <n-modal v-model:show="showBrowserModal" preset="card" style="width: min(760px, 96vw)" title="Browser Auth 导入">
       <template v-if="browserSession">
         <n-space vertical size="large">
           <n-thing title="1. 打开授权链接">
             <template #description>
-              在浏览器中完成登录，然后让浏览器跳转到回调地址。
+              在浏览器中完成登录。OpenAI 完成授权后，会直接回跳到当前服务的同域 callback API，再自动带你回到前端结果页。
             </template>
             <n-space wrap>
               <n-button type="primary" tag="a" :href="browserSession.authorization_url ?? undefined" target="_blank">
@@ -510,17 +625,59 @@ onMounted(() => {
             </n-space>
           </n-thing>
 
-          <n-thing title="2. 粘贴回调 URL">
-            <template #description>
-              把浏览器地址栏里完整的 callback URL 粘贴到这里，后端会自行解析 `code` 与 `state`。
-            </template>
-            <n-input
-              v-model:value="browserCallbackUrl"
-              type="textarea"
-              :rows="4"
-              placeholder="http://localhost:1455/auth/callback?code=...&state=..."
-            />
-          </n-thing>
+          <n-alert
+            v-if="browserAutoCallbackReady"
+            type="success"
+            :show-icon="false"
+          >
+            当前 Browser Auth 会在登录完成后回跳到本控制台的
+            <span class="mono">{{ browserSession.auth_redirect_url }}</span>
+            ，后端会直接完成 OAuth code 交换和凭证托管，不需要再手工粘贴 callback URL。
+          </n-alert>
+          <n-alert v-else type="warning" :show-icon="false">
+            当前服务返回的 Auth Callback 不是预期的同域 API 地址：
+            <span class="mono">{{ browserAuthApiCallbackUrl }}</span>
+            。这通常意味着代理头没有正确透传；必要时可以显式配置
+            <span class="mono">CODEX_PROXY_PUBLIC_BASE_URL</span>
+            。
+          </n-alert>
+
+          <n-space justify="space-between" wrap class="browser-status-line">
+            <n-space align="center" wrap>
+              <span class="filter-label">会话状态</span>
+              <n-tag
+                :type="
+                  browserSession.auth_status === 'completed'
+                    ? 'success'
+                    : browserSession.auth_status === 'failed'
+                      ? 'error'
+                      : browserSession.auth_status === 'cancelled'
+                        ? 'default'
+                        : 'warning'
+                "
+              >
+                {{ browserSession.auth_status }}
+              </n-tag>
+            </n-space>
+            <n-button secondary @click="copy(browserAuthApiCallbackUrl, '推荐 callback URL 已复制')">
+              复制推荐 Callback URL
+            </n-button>
+          </n-space>
+
+          <n-alert
+            v-if="browserSession.auth_status === 'completed'"
+            type="success"
+            :show-icon="false"
+          >
+            Browser Auth 已完成，凭证已经进入服务托管。
+          </n-alert>
+          <n-alert
+            v-else-if="browserSession.auth_error"
+            type="error"
+            :show-icon="false"
+          >
+            {{ browserSession.auth_error }}
+          </n-alert>
 
           <div class="mono browser-meta">
             redirect: {{ browserSession.auth_redirect_url ?? '未返回 redirect' }}
@@ -530,9 +687,6 @@ onMounted(() => {
       <template #action>
         <n-space justify="end">
           <n-button @click="showBrowserModal = false">关闭</n-button>
-          <n-button type="primary" :disabled="!browserCallbackUrl.trim()" @click="completeBrowserAuth">
-            提交回调
-          </n-button>
         </n-space>
       </template>
     </n-modal>
@@ -540,6 +694,26 @@ onMounted(() => {
     <n-modal v-model:show="showDeviceModal" preset="card" style="width: min(640px, 96vw)" title="Device Code Auth">
       <template v-if="deviceSession">
         <n-space vertical size="large">
+          <n-space justify="space-between" wrap class="browser-status-line">
+            <n-space align="center" wrap>
+              <span class="filter-label">会话状态</span>
+              <n-tag
+                :type="
+                  deviceSession.auth_status === 'completed'
+                    ? 'success'
+                    : deviceSession.auth_status === 'failed'
+                      ? 'error'
+                      : deviceSession.auth_status === 'cancelled'
+                        ? 'default'
+                        : 'warning'
+                "
+              >
+                {{ deviceSession.auth_status }}
+              </n-tag>
+            </n-space>
+            <span class="filter-label">会话会在页面自动刷新时同步状态</span>
+          </n-space>
+
           <n-thing title="打开验证页">
             <template #description>
               打开验证地址，输入 user code 后等待后端后台轮询完成。
@@ -560,6 +734,21 @@ onMounted(() => {
             轮询间隔：
             {{ deviceSession.device_code_interval_seconds ?? '未提供' }} 秒
           </div>
+
+          <n-alert
+            v-if="deviceSession.auth_status === 'completed'"
+            type="success"
+            :show-icon="false"
+          >
+            Device Code Auth 已完成，凭证已经就绪。
+          </n-alert>
+          <n-alert
+            v-else-if="deviceSession.auth_error"
+            type="error"
+            :show-icon="false"
+          >
+            {{ deviceSession.auth_error }}
+          </n-alert>
         </n-space>
       </template>
       <template #action>
@@ -732,6 +921,25 @@ onMounted(() => {
   font-size: clamp(28px, 4vw, 38px);
   font-weight: 800;
   letter-spacing: 0.18em;
+}
+
+.import-method-panel {
+  padding: 16px 18px;
+  border-radius: 18px;
+  border: 1px solid var(--cp-border);
+  background: rgba(255, 250, 242, 0.78);
+}
+
+.import-method-panel__title {
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+
+.import-method-panel__body {
+  margin-top: 8px;
+  color: var(--cp-text-soft);
+  line-height: 1.7;
 }
 
 .empty-state {

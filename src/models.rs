@@ -85,17 +85,36 @@ impl AuthStatus {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct CreateCredentialRequest {
-    #[serde(rename = "credential_name")]
-    pub name: String,
-    #[serde(rename = "is_enabled")]
-    pub enabled: Option<bool>,
-    #[serde(rename = "load_balance_weight")]
-    pub selection_weight: Option<i32>,
-    #[serde(rename = "credential_notes")]
-    pub notes: Option<String>,
-    pub upstream_base_url: Option<String>,
+pub struct AdminLoginRequest {
+    #[serde(rename = "admin_password")]
+    pub password: String,
 }
+
+#[derive(Debug, Serialize)]
+pub struct AdminSessionView {
+    pub principal_kind: String,
+    #[serde(rename = "api_key_id")]
+    pub api_key_id: Option<String>,
+    #[serde(rename = "api_key_name")]
+    pub api_key_name: Option<String>,
+    #[serde(rename = "admin_session_created_at")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(rename = "admin_session_last_used_at")]
+    pub last_used_at: Option<DateTime<Utc>>,
+    #[serde(rename = "admin_session_expires_at")]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminLoginResponse {
+    #[serde(rename = "admin_session_token")]
+    pub session_token: String,
+    #[serde(rename = "admin_session")]
+    pub session: AdminSessionView,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CreateCredentialRequest {}
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateCredentialRequest {
@@ -114,12 +133,6 @@ pub struct UpdateCredentialRequest {
 pub struct StartBrowserAuthRequest {
     #[serde(rename = "credential_id")]
     pub credential_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CompleteBrowserAuthRequest {
-    #[serde(rename = "callback_url")]
-    pub callback_url: String,
 }
 
 #[derive(Debug, Deserialize)]

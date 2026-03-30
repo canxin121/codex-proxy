@@ -31,8 +31,8 @@ async fn main() -> anyhow::Result<()> {
         "starting codex proxy",
     );
     info!(
-        admin_token = %config.admin_token,
-        "using admin bearer token",
+        admin_password_auth = true,
+        "using password-based admin login",
     );
 
     let state = AppState::new(config.clone()).await?;
