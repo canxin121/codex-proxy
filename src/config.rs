@@ -1,6 +1,6 @@
 use clap::Parser;
 use codex_login::CLIENT_ID;
-use rand::Rng;
+use rand::RngExt;
 use rand::distr::Alphanumeric;
 use std::net::SocketAddr;
 use std::path::PathBuf;

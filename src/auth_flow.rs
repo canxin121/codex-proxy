@@ -9,7 +9,7 @@ use codex_login::TokenData;
 use codex_login::default_client::originator;
 use codex_login::save_auth;
 use codex_login::token_data::parse_chatgpt_jwt_claims;
-use rand::RngCore;
+use rand::Rng;
 use reqwest::StatusCode;
 use sha2::Digest;
 use sha2::Sha256;

@@ -607,7 +607,11 @@ fn limit_remaining_percent(limit: &credential_limit::Model) -> f64 {
 pub fn hash_api_key(key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn extract_token_flags(auth: Option<CodexAuth>) -> (bool, bool) {

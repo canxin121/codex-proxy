@@ -67,7 +67,7 @@ use codex_login::complete_device_code_login;
 use codex_login::request_device_code;
 use futures::SinkExt;
 use futures::StreamExt;
-use rand::Rng;
+use rand::RngExt;
 use rand::distr::Alphanumeric;
 use sea_orm::ActiveModelTrait;
 use sea_orm::ColumnTrait;
