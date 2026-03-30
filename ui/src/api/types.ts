@@ -241,6 +241,10 @@ export interface StartBrowserAuthPayload {
   credential_id: string
 }
 
+export interface CompleteBrowserAuthPayload {
+  callback_url: string
+}
+
 export interface StartDeviceCodeAuthPayload {
   credential_id: string
 }

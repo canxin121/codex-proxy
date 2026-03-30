@@ -30,11 +30,14 @@ use sea_orm::Statement;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -117,7 +120,9 @@ impl Drop for RequestLease {
 
 impl AppState {
     pub async fn new(config: AppConfig) -> Result<Self, AppError> {
+        std::fs::create_dir_all(&config.data_dir)?;
         std::fs::create_dir_all(config.data_dir.join("credentials"))?;
+        ensure_sqlite_database_writable(&config.database_url)?;
 
         let db = Database::connect(config.database_url.as_str())
             .await
@@ -748,6 +753,72 @@ fn generate_session_token() -> String {
     format!("cps_{suffix}")
 }
 
+fn ensure_sqlite_database_writable(database_url: &str) -> Result<(), AppError> {
+    let Some(database_path) = sqlite_database_path(database_url) else {
+        return Ok(());
+    };
+
+    let database_dir = database_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&database_dir).map_err(|err| {
+        AppError::internal(format!(
+            "sqlite database directory {} is not writable: {}. Set CODEX_PROXY_DATA_DIR or CODEX_PROXY_DATABASE_URL to a writable location.",
+            database_dir.display(),
+            err
+        ))
+    })?;
+    ensure_directory_writable(&database_dir)?;
+
+    if database_path.exists() {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .map_err(|err| {
+                AppError::internal(format!(
+                    "sqlite database file {} is not writable: {}. Set CODEX_PROXY_DATA_DIR or CODEX_PROXY_DATABASE_URL to a writable location.",
+                    database_path.display(),
+                    err
+                ))
+            })?;
+    }
+
+    Ok(())
+}
+
+fn ensure_directory_writable(path: &Path) -> Result<(), AppError> {
+    let probe_path = path.join(format!(".codex-proxy-write-probe-{}", Uuid::new_v4()));
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe_path)
+        .map_err(|err| {
+            AppError::internal(format!(
+                "sqlite database directory {} is not writable: {}. Set CODEX_PROXY_DATA_DIR or CODEX_PROXY_DATABASE_URL to a writable location.",
+                path.display(),
+                err
+            ))
+        })?;
+    let _ = std::fs::remove_file(probe_path);
+    Ok(())
+}
+
+fn sqlite_database_path(database_url: &str) -> Option<PathBuf> {
+    if database_url.starts_with("sqlite::memory:") {
+        return None;
+    }
+
+    let path = database_url.strip_prefix("sqlite://")?;
+    let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
+    if path.is_empty() || path == ":memory:" {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
 fn retain_active_admin_sessions(
     sessions: &mut HashMap<String, AdminSessionRecord>,
     now: DateTime<Utc>,
@@ -931,4 +1002,28 @@ async fn recover_auth_sessions(db: &DatabaseConnection) -> Result<(), AppError> 
         .await
         .map_err(|err| AppError::internal(err.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sqlite_database_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn sqlite_database_path_extracts_file_backed_sqlite_urls() {
+        assert_eq!(
+            sqlite_database_path("sqlite:///tmp/codex-proxy/codex-proxy.sqlite?mode=rwc"),
+            Some(PathBuf::from("/tmp/codex-proxy/codex-proxy.sqlite"))
+        );
+        assert_eq!(
+            sqlite_database_path("sqlite://relative/codex-proxy.sqlite"),
+            Some(PathBuf::from("relative/codex-proxy.sqlite"))
+        );
+    }
+
+    #[test]
+    fn sqlite_database_path_ignores_memory_databases() {
+        assert_eq!(sqlite_database_path("sqlite::memory:"), None);
+        assert_eq!(sqlite_database_path("sqlite://:memory:"), None);
+    }
 }

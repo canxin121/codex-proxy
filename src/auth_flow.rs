@@ -197,7 +197,9 @@ fn build_authorization_url(
         ("state".to_string(), oauth_state.to_string()),
         ("originator".to_string(), originator().value),
     ];
-    if let Some(workspace_id) = forced_chatgpt_workspace_id {
+    if let Some(workspace_id) = forced_chatgpt_workspace_id.map(str::trim)
+        && !workspace_id.is_empty()
+    {
         query.push(("allowed_workspace_id".to_string(), workspace_id.to_string()));
     }
 
@@ -546,6 +548,35 @@ mod tests {
         assert_eq!(
             callback_error_message("invalid_request", None),
             "Sign-in failed: invalid_request"
+        );
+    }
+
+    #[test]
+    fn build_authorization_url_skips_blank_allowed_workspace_id() {
+        let url_without_workspace = build_authorization_url(
+            "https://auth.openai.com",
+            "client",
+            "http://localhost:1455/auth/callback",
+            "challenge",
+            "state",
+            Some("   "),
+        );
+        let url_with_workspace = build_authorization_url(
+            "https://auth.openai.com",
+            "client",
+            "http://localhost:1455/auth/callback",
+            "challenge",
+            "state",
+            Some("workspace-123"),
+        );
+
+        assert!(
+            !url_without_workspace.contains("allowed_workspace_id"),
+            "blank workspace id should be omitted: {url_without_workspace}"
+        );
+        assert!(
+            url_with_workspace.contains("allowed_workspace_id=workspace-123"),
+            "expected non-blank workspace id to be preserved: {url_with_workspace}"
         );
     }
 

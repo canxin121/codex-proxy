@@ -136,6 +136,12 @@ pub struct StartBrowserAuthRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CompleteBrowserAuthRequest {
+    #[serde(rename = "callback_url")]
+    pub callback_url: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct StartDeviceCodeAuthRequest {
     #[serde(rename = "credential_id")]
     pub credential_id: String,

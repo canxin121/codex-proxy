@@ -51,10 +51,6 @@ function persistEntries(entries: PendingBrowserAuthSession[]) {
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify(entries))
 }
 
-export function expectedBrowserAuthApiCallbackUrl() {
-  return new URL('/admin/auth/browser/callback', window.location.origin).toString()
-}
-
 export function extractOauthState(urlValue: string | null | undefined): string | null {
   if (!urlValue) {
     return null

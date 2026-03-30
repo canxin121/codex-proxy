@@ -11,6 +11,7 @@ use crate::models::ApiKeyView;
 use crate::models::AuthMethod;
 use crate::models::AuthSessionView;
 use crate::models::AuthStatus;
+use crate::models::CompleteBrowserAuthRequest;
 use crate::models::CreateApiKeyRequest;
 use crate::models::CreateApiKeyResponse;
 use crate::models::CreateCredentialRequest;
@@ -170,6 +171,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/admin/auth/browser", post(start_browser_auth))
         .route("/admin/auth/browser/callback", get(browser_auth_callback))
+        .route(
+            "/admin/auth/browser/{id}/complete",
+            post(complete_browser_auth_session),
+        )
         .route("/admin/auth/device-code", post(start_device_code_auth))
         .route("/admin/api-keys", get(list_api_keys).post(create_api_key))
         .route(
@@ -448,7 +453,7 @@ async fn start_browser_auth(
     find_credential(&state, &payload.credential_id).await?;
     cancel_pending_auth_sessions_for_credential(&state, &payload.credential_id).await?;
 
-    let redirect_uri = browser_auth_api_callback_url(&headers, state.config())?;
+    let redirect_uri = state.config().auth_callback_url.clone();
     let auth_start = auth_flow::start_browser_auth(state.config(), redirect_uri);
     let now = Utc::now();
     let model = auth_session::ActiveModel {
@@ -474,6 +479,22 @@ async fn start_browser_auth(
         .await
         .map_err(|err| AppError::internal(err.to_string()))?;
     Ok((StatusCode::CREATED, Json(auth_session_to_view(inserted)?)))
+}
+
+async fn complete_browser_auth_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<CompleteBrowserAuthRequest>,
+) -> Result<Json<AuthSessionView>, AppError> {
+    require_admin(&state, &headers).await?;
+    let session = find_auth_session(&state, &id).await?;
+    if auth_session_status(&session)? != AuthStatus::Pending {
+        return Ok(Json(auth_session_to_view(session)?));
+    }
+
+    let updated = finalize_browser_auth_session(&state, &session, &payload.callback_url).await?;
+    Ok(Json(auth_session_to_view(updated)?))
 }
 
 async fn browser_auth_callback(
@@ -519,80 +540,7 @@ async fn browser_auth_callback(
         }
     };
 
-    let completion = match auth_flow::parse_browser_callback(&callback_url, oauth_state) {
-        Ok(completion) => completion,
-        Err(err) => {
-            let _ = mark_auth_session_failed(&state, &session.id, err.to_string()).await;
-            return Redirect::to(&browser_auth_result_redirect_path(
-                Some(&session.id),
-                Some(&session.credential_id),
-                AuthStatus::Failed.as_str(),
-                Some(err.to_string()),
-            ));
-        }
-    };
-
-    let redirect_uri = match session.redirect_uri.clone() {
-        Some(value) => value,
-        None => {
-            let message = "browser auth session is missing redirect_uri".to_string();
-            let _ = mark_auth_session_failed(&state, &session.id, message.clone()).await;
-            return Redirect::to(&browser_auth_result_redirect_path(
-                Some(&session.id),
-                Some(&session.credential_id),
-                AuthStatus::Failed.as_str(),
-                Some(message),
-            ));
-        }
-    };
-    let pkce_code_verifier = match session.pkce_code_verifier.clone() {
-        Some(value) => value,
-        None => {
-            let message = "browser auth session is missing pkce_code_verifier".to_string();
-            let _ = mark_auth_session_failed(&state, &session.id, message.clone()).await;
-            return Redirect::to(&browser_auth_result_redirect_path(
-                Some(&session.id),
-                Some(&session.credential_id),
-                AuthStatus::Failed.as_str(),
-                Some(message),
-            ));
-        }
-    };
-
-    if let Err(err) = auth_flow::complete_browser_auth(
-        state.config(),
-        &state.credential_home(&session.credential_id),
-        &redirect_uri,
-        &pkce_code_verifier,
-        &completion.oauth_code,
-    )
-    .await
-    {
-        let _ = mark_auth_session_failed(&state, &session.id, err.to_string()).await;
-        return Redirect::to(&browser_auth_result_redirect_path(
-            Some(&session.id),
-            Some(&session.credential_id),
-            AuthStatus::Failed.as_str(),
-            Some(err.to_string()),
-        ));
-    }
-
-    state.invalidate_auth_manager(&session.credential_id);
-    if let Err(err) = state
-        .sync_credential_from_auth(&session.credential_id)
-        .await
-    {
-        let _ = mark_auth_session_failed(&state, &session.id, err.to_string()).await;
-        return Redirect::to(&browser_auth_result_redirect_path(
-            Some(&session.id),
-            Some(&session.credential_id),
-            AuthStatus::Failed.as_str(),
-            Some(err.to_string()),
-        ));
-    }
-    let update_result =
-        set_auth_session_status(&state, &session.id, AuthStatus::Completed, None).await;
-    match update_result {
+    match finalize_browser_auth_session(&state, &session, &callback_url).await {
         Ok(updated) => Redirect::to(&browser_auth_result_redirect_path(
             Some(&updated.id),
             Some(&updated.credential_id),
@@ -606,6 +554,67 @@ async fn browser_auth_callback(
             Some(err.to_string()),
         )),
     }
+}
+
+async fn finalize_browser_auth_session(
+    state: &AppState,
+    session: &auth_session::Model,
+    callback_url: &str,
+) -> Result<auth_session::Model, AppError> {
+    let oauth_state = session
+        .oauth_state
+        .clone()
+        .ok_or_else(|| AppError::internal("browser auth session is missing oauth_state"))?;
+    let completion = match auth_flow::parse_browser_callback(callback_url, &oauth_state) {
+        Ok(completion) => completion,
+        Err(err) => {
+            let _ = mark_auth_session_failed(state, &session.id, err.to_string()).await;
+            return Err(err);
+        }
+    };
+
+    let redirect_uri = match session.redirect_uri.clone() {
+        Some(value) => value,
+        None => {
+            let message = "browser auth session is missing redirect_uri".to_string();
+            let _ = mark_auth_session_failed(state, &session.id, message.clone()).await;
+            return Err(AppError::internal(message));
+        }
+    };
+    let pkce_code_verifier = match session.pkce_code_verifier.clone() {
+        Some(value) => value,
+        None => {
+            let message = "browser auth session is missing pkce_code_verifier".to_string();
+            let _ = mark_auth_session_failed(state, &session.id, message.clone()).await;
+            return Err(AppError::internal(message));
+        }
+    };
+
+    if let Err(err) = auth_flow::complete_browser_auth(
+        state.config(),
+        &state.credential_home(&session.credential_id),
+        &redirect_uri,
+        &pkce_code_verifier,
+        &completion.oauth_code,
+    )
+    .await
+    {
+        let _ = mark_auth_session_failed(state, &session.id, err.to_string()).await;
+        return Err(err);
+    }
+
+    state.invalidate_auth_manager(&session.credential_id);
+    if let Err(err) = state
+        .sync_credential_from_auth(&session.credential_id)
+        .await
+    {
+        let _ = mark_auth_session_failed(state, &session.id, err.to_string()).await;
+        return Err(err);
+    }
+
+    set_auth_session_status(state, &session.id, AuthStatus::Completed, None)
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))
 }
 
 async fn start_device_code_auth(
@@ -2985,6 +2994,7 @@ mod tests {
             chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             auth_issuer: "https://auth.openai.com".to_string(),
             auth_client_id: "client".to_string(),
+            auth_callback_url: "http://localhost:1455/auth/callback".to_string(),
             public_base_url: Some("https://public.example/app".to_string()),
             forced_chatgpt_workspace_id: None,
         };

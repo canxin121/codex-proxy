@@ -22,9 +22,7 @@ import type { AuthSessionView, CredentialView } from '@/api/types'
 import { useAutoRefresh } from '@/composables/use-auto-refresh'
 import { useSessionStore } from '@/stores/session'
 import {
-  expectedBrowserAuthApiCallbackUrl,
   forgetPendingBrowserAuthSession,
-  normalizeComparableUrl,
   rememberPendingBrowserAuthSession,
   syncPendingBrowserAuthSessions,
 } from '@/utils/browser-auth'
@@ -45,11 +43,8 @@ const credentialFilter = ref<string | null>(null)
 const searchKeyword = ref('')
 const showCompleteModal = ref(false)
 const completingSession = ref<AuthSessionView | null>(null)
-const browserAuthApiCallbackUrl = computed(() => expectedBrowserAuthApiCallbackUrl())
-const completingSessionAutoReady = computed(() =>
-  normalizeComparableUrl(completingSession.value?.auth_redirect_url)
-  === normalizeComparableUrl(browserAuthApiCallbackUrl.value),
-)
+const browserCallbackUrl = ref('')
+const submittingBrowserCallback = ref(false)
 
 const filteredSessions = computed(() => {
   const keyword = searchKeyword.value.trim().toLowerCase()
@@ -150,7 +145,33 @@ function openCompleteModal(item: AuthSessionView) {
     credentials.value.find((credential) => credential.credential_id === item.credential_id)?.credential_name ?? null
   rememberPendingBrowserAuthSession(item, credentialName)
   completingSession.value = item
+  browserCallbackUrl.value = ''
   showCompleteModal.value = true
+}
+
+async function completeBrowserAuthFromCallbackUrl() {
+  if (!completingSession.value || !browserCallbackUrl.value.trim()) {
+    return
+  }
+
+  submittingBrowserCallback.value = true
+  try {
+    const updated = await api.completeBrowserAuth(
+      session.apiContext,
+      completingSession.value.auth_session_id,
+      {
+        callback_url: browserCallbackUrl.value.trim(),
+      },
+    )
+    completingSession.value = updated
+    browserCallbackUrl.value = ''
+    message.success('callback URL 已提交')
+    await load()
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : String(error))
+  } finally {
+    submittingBrowserCallback.value = false
+  }
 }
 
 useAutoRefresh(
@@ -379,26 +400,15 @@ onMounted(() => {
     >
       <template v-if="completingSession">
         <n-space vertical size="large">
-          <n-alert
-            v-if="completingSessionAutoReady"
-            type="success"
-            :show-icon="false"
-          >
-            当前 Browser Auth 会在登录完成后自动回到控制台的
+          <n-alert type="info" :show-icon="false">
+            当前 Browser Auth 使用本机 callback 地址
             <span class="mono">{{ completingSession.auth_redirect_url }}</span>
-            ，后端会直接处理 OAuth callback，不需要手工提交任何 URL。
-          </n-alert>
-          <n-alert v-else type="warning" :show-icon="false">
-            当前服务返回的 Auth Callback 不是预期的同域 API 地址：
-            <span class="mono">{{ browserAuthApiCallbackUrl }}</span>
-            。这通常意味着反向代理头没有正确透传；必要时可以显式配置
-            <span class="mono">CODEX_PROXY_PUBLIC_BASE_URL</span>
-            。
+            。登录完成后，请把浏览器地址栏里的完整 callback URL 粘贴到下面提交。
           </n-alert>
 
           <n-thing title="1. 完成登录">
             <template #description>
-              打开授权页完成登录。登录成功后，浏览器会先回到后端的同域 callback API，再自动跳回控制台结果页。
+              打开授权页完成登录。登录成功后，浏览器会先回到本机 callback URL，再由你在下面提交完整 callback URL。
             </template>
             <n-space wrap>
               <n-button
@@ -416,6 +426,30 @@ onMounted(() => {
               >
                 复制授权链接
               </n-button>
+            </n-space>
+          </n-thing>
+
+          <n-thing title="2. 手动提交 callback URL">
+            <template #description>
+              如果浏览器地址栏里出现了完整的 callback URL，把整段 URL 粘贴进来再提交。
+            </template>
+            <n-space vertical size="small">
+              <n-input
+                v-model:value="browserCallbackUrl"
+                type="textarea"
+                :autosize="{ minRows: 3, maxRows: 5 }"
+                placeholder="http://localhost:1455/auth/callback?code=...&state=..."
+              />
+              <n-space justify="end">
+                <n-button
+                  secondary
+                  :disabled="!browserCallbackUrl.trim() || submittingBrowserCallback"
+                  :loading="submittingBrowserCallback"
+                  @click="completeBrowserAuthFromCallbackUrl"
+                >
+                  提交 Callback URL
+                </n-button>
+              </n-space>
             </n-space>
           </n-thing>
         </n-space>

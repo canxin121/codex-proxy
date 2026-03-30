@@ -40,9 +40,7 @@ import type { AuthSessionView, CredentialView } from '@/api/types'
 import { useSessionStore } from '@/stores/session'
 import { useAutoRefresh } from '@/composables/use-auto-refresh'
 import {
-  expectedBrowserAuthApiCallbackUrl,
   forgetPendingBrowserAuthSession,
-  normalizeComparableUrl,
   rememberPendingBrowserAuthSession,
 } from '@/utils/browser-auth'
 import {
@@ -67,6 +65,8 @@ const editingCredential = ref<CredentialView | null>(null)
 const importAuthMethod = ref<'browser' | 'device_code'>('browser')
 const showBrowserModal = ref(false)
 const browserSession = ref<AuthSessionView | null>(null)
+const browserCallbackUrl = ref('')
+const submittingBrowserCallback = ref(false)
 const showDeviceModal = ref(false)
 const deviceSession = ref<AuthSessionView | null>(null)
 const syncingTrackedSessions = ref(false)
@@ -112,12 +112,6 @@ const summary = computed(() => ({
   authenticated: credentials.value.filter((item) => item.credential_has_auth).length,
   failures: credentials.value.reduce((sum, item) => sum + item.request_stats.failure_request_count, 0),
 }))
-
-const browserAuthApiCallbackUrl = computed(() => expectedBrowserAuthApiCallbackUrl())
-const browserAutoCallbackReady = computed(() =>
-  normalizeComparableUrl(browserSession.value?.auth_redirect_url)
-  === normalizeComparableUrl(browserAuthApiCallbackUrl.value),
-)
 
 function resetForm() {
   form.credential_name = ''
@@ -285,15 +279,37 @@ async function startBrowserAuth(item: CredentialView) {
     })
     rememberPendingBrowserAuthSession(response, item.credential_name)
     browserSession.value = response
+    browserCallbackUrl.value = ''
     showBrowserModal.value = true
-    message.success(
-      normalizeComparableUrl(response.auth_redirect_url) === normalizeComparableUrl(browserAuthApiCallbackUrl.value)
-        ? 'Browser Auth 会话已创建，完成登录后会自动回到当前 GUI 继续托管'
-        : 'Browser Auth 会话已创建',
-    )
+    message.success('Browser Auth 会话已创建，完成登录后请把 callback URL 粘贴到弹窗里提交')
     await load()
   } catch (error) {
     message.error(error instanceof Error ? error.message : String(error))
+  }
+}
+
+async function completeBrowserAuthFromCallbackUrl() {
+  if (!browserSession.value || !browserCallbackUrl.value.trim()) {
+    return
+  }
+
+  submittingBrowserCallback.value = true
+  try {
+    const updated = await api.completeBrowserAuth(
+      session.apiContext,
+      browserSession.value.auth_session_id,
+      {
+        callback_url: browserCallbackUrl.value.trim(),
+      },
+    )
+    browserSession.value = updated
+    browserCallbackUrl.value = ''
+    message.success('callback URL 已提交')
+    await load()
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : String(error))
+  } finally {
+    submittingBrowserCallback.value = false
   }
 }
 
@@ -573,11 +589,7 @@ onMounted(() => {
           </n-thing>
 
           <n-alert v-if="importAuthMethod === 'browser'" type="info" :show-icon="false">
-            Browser Auth 会直接使用当前控制台同域的后端 API 回调地址
-            <span class="mono">{{ browserAuthApiCallbackUrl }}</span>
-            。正常情况下不需要额外监听 localhost 端口；如果实际返回的回调地址不对，再检查反向代理头或配置
-            <span class="mono">CODEX_PROXY_PUBLIC_BASE_URL</span>
-            。
+            Browser Auth 会使用会话里返回的本机 callback 地址。创建后会显示具体 URL；登录完成后，如果浏览器没有自动带回当前页面，请把地址栏里的完整 callback URL 粘贴到下面提交。
           </n-alert>
 
           <div class="import-method-panel">
@@ -587,7 +599,7 @@ onMounted(() => {
             <div class="import-method-panel__body">
               {{
                 importAuthMethod === 'browser'
-                  ? '导入后会立刻生成授权链接。完成登录后，后端会在同域 callback API 里直接完成 code 交换、凭证落库，再跳回前端结果页。'
+                  ? '导入后会立刻生成授权链接和本机 callback URL。完成登录后，如果页面没有自动完成，请把完整 callback URL 粘贴到下面提交。'
                   : '导入后会立刻生成 verification URL 和 user code。你完成输入后，后端会后台轮询直到授权完成。'
               }}
             </div>
@@ -613,7 +625,9 @@ onMounted(() => {
         <n-space vertical size="large">
           <n-thing title="1. 打开授权链接">
             <template #description>
-              在浏览器中完成登录。OpenAI 完成授权后，会直接回跳到当前服务的同域 callback API，再自动带你回到前端结果页。
+              在浏览器中完成登录。OpenAI 完成授权后会先回跳到
+              <span class="mono">{{ browserSession.auth_redirect_url }}</span>
+              ；如果浏览器没有自动完成，请把地址栏里的完整 callback URL 粘贴到下面提交。
             </template>
             <n-space wrap>
               <n-button type="primary" tag="a" :href="browserSession.authorization_url ?? undefined" target="_blank">
@@ -625,21 +639,10 @@ onMounted(() => {
             </n-space>
           </n-thing>
 
-          <n-alert
-            v-if="browserAutoCallbackReady"
-            type="success"
-            :show-icon="false"
-          >
-            当前 Browser Auth 会在登录完成后回跳到本控制台的
+          <n-alert type="info" :show-icon="false">
+            本次 Browser Auth 使用的 callback 地址是
             <span class="mono">{{ browserSession.auth_redirect_url }}</span>
-            ，后端会直接完成 OAuth code 交换和凭证托管，不需要再手工粘贴 callback URL。
-          </n-alert>
-          <n-alert v-else type="warning" :show-icon="false">
-            当前服务返回的 Auth Callback 不是预期的同域 API 地址：
-            <span class="mono">{{ browserAuthApiCallbackUrl }}</span>
-            。这通常意味着代理头没有正确透传；必要时可以显式配置
-            <span class="mono">CODEX_PROXY_PUBLIC_BASE_URL</span>
-            。
+            。请在登录结束后，把浏览器地址栏里的完整 URL 粘贴到下方提交。
           </n-alert>
 
           <n-space justify="space-between" wrap class="browser-status-line">
@@ -659,9 +662,6 @@ onMounted(() => {
                 {{ browserSession.auth_status }}
               </n-tag>
             </n-space>
-            <n-button secondary @click="copy(browserAuthApiCallbackUrl, '推荐 callback URL 已复制')">
-              复制推荐 Callback URL
-            </n-button>
           </n-space>
 
           <n-alert
@@ -679,9 +679,29 @@ onMounted(() => {
             {{ browserSession.auth_error }}
           </n-alert>
 
-          <div class="mono browser-meta">
-            redirect: {{ browserSession.auth_redirect_url ?? '未返回 redirect' }}
-          </div>
+          <n-thing title="2. 手动提交 callback URL">
+            <template #description>
+              如果浏览器地址栏里已经是完整 callback URL，就直接粘贴到这里提交。
+            </template>
+            <n-space vertical size="small">
+              <n-input
+                v-model:value="browserCallbackUrl"
+                type="textarea"
+                :autosize="{ minRows: 3, maxRows: 5 }"
+                placeholder="http://localhost:1455/auth/callback?code=...&state=..."
+              />
+              <n-space justify="end">
+                <n-button
+                  secondary
+                  :disabled="!browserCallbackUrl.trim() || submittingBrowserCallback"
+                  :loading="submittingBrowserCallback"
+                  @click="completeBrowserAuthFromCallbackUrl"
+                >
+                  提交 Callback URL
+                </n-button>
+              </n-space>
+            </n-space>
+          </n-thing>
         </n-space>
       </template>
       <template #action>

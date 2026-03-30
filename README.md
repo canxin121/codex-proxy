@@ -110,7 +110,9 @@ Useful auth-related options:
 --auth-callback-url http://localhost:1455/auth/callback
 ```
 
-`--auth-callback-url` is the URL that OpenAI redirects to after browser auth. `codex-proxy` does not have to listen on that URL. The intended flow is: finish login in a browser, let the browser land on that callback URL, then copy the full callback URL from the address bar and send it to the backend through `/admin/auth/browser/:id/complete`.
+`--auth-callback-url` is the local callback URL that OpenAI redirects to after browser auth. `codex-proxy` does not have to listen on that URL. The intended flow is: finish login in a browser, let the browser land on that callback URL, then copy the full callback URL from the address bar and send it to the backend through `/admin/auth/browser/:id/complete` or paste it into the Browser Auth import modal.
+
+To stay aligned with the official Codex browser login flow, `--auth-callback-url` must remain an explicit loopback HTTP URL such as `http://localhost:1455/auth/callback`.
 
 If `CODEX_PROXY_ADMIN_TOKEN` is not set, the service generates one at startup and prints it to logs.
 
@@ -206,7 +208,7 @@ Then:
 2. Finish sign-in.
 3. Let the browser redirect to `auth_redirect_url`.
 4. Copy the full callback URL from the browser address bar.
-5. Submit it back:
+5. Submit it back through the API, the Browser Auth import modal, or the Auth Sessions page:
 
 ```json
 POST /admin/auth/browser/:auth_session_id/complete
@@ -214,6 +216,8 @@ POST /admin/auth/browser/:auth_session_id/complete
   "callback_url": "http://localhost:1455/auth/callback?code=...&state=..."
 }
 ```
+
+In the GUI, open the Browser Auth import modal and paste the callback URL into the manual completion field. You can also do the same from the matching Auth Session if you prefer the session ledger view.
 
 ## Device-code auth flow
 

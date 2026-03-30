@@ -5,6 +5,7 @@ import type {
   AdminSessionView,
   ApiKeyView,
   AuthSessionView,
+  CompleteBrowserAuthPayload,
   CreateApiKeyPayload,
   CreateApiKeyResponse,
   CreateCredentialPayload,
@@ -72,6 +73,12 @@ export const api = {
   },
   startBrowserAuth(context: ApiContext, payload: StartBrowserAuthPayload) {
     return apiRequest<AuthSessionView>(context, '/admin/auth/browser', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  completeBrowserAuth(context: ApiContext, authSessionId: string, payload: CompleteBrowserAuthPayload) {
+    return apiRequest<AuthSessionView>(context, `/admin/auth/browser/${authSessionId}/complete`, {
       method: 'POST',
       body: JSON.stringify(payload),
     })
