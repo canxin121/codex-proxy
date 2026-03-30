@@ -28,16 +28,19 @@ use chrono::Utc;
 use codex_protocol::protocol::TokenUsage;
 use sea_orm::ActiveModelTrait;
 use sea_orm::ColumnTrait;
-use sea_orm::DbBackend;
 use sea_orm::EntityTrait;
-use sea_orm::FromQueryResult;
 use sea_orm::PaginatorTrait;
 use sea_orm::QueryFilter;
 use sea_orm::QueryOrder;
 use sea_orm::QuerySelect;
+use sea_orm::Select;
 use sea_orm::Set;
-use sea_orm::Statement;
-use sea_orm::Value as SeaValue;
+use sea_orm::sea_query::Alias;
+use sea_orm::sea_query::BinOper;
+use sea_orm::sea_query::Condition;
+use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::Func;
+use sea_orm::sea_query::SimpleExpr;
 use serde_json::Value;
 use tokio::runtime::Handle;
 use uuid::Uuid;
@@ -54,10 +57,18 @@ enum TimeBucket {
 }
 
 impl TimeBucket {
-    fn expression(self) -> &'static str {
+    fn expression(self) -> SimpleExpr {
         match self {
-            Self::Hour => "substr(request_started_at, 12, 2)",
-            Self::Day => "substr(request_started_at, 1, 10)",
+            Self::Hour => Func::cust(Alias::new("substr"))
+                .arg(Expr::col(request_record::Column::RequestStartedAt))
+                .arg(12)
+                .arg(2)
+                .into(),
+            Self::Day => Func::cust(Alias::new("substr"))
+                .arg(Expr::col(request_record::Column::RequestStartedAt))
+                .arg(1)
+                .arg(10)
+                .into(),
         }
     }
 
@@ -82,29 +93,40 @@ enum BreakdownDimension {
 }
 
 impl BreakdownDimension {
-    fn expressions(self) -> (&'static str, &'static str) {
+    fn expressions(self) -> (SimpleExpr, SimpleExpr) {
         match self {
-            Self::Credential => ("credential_id", "credential_name"),
+            Self::Credential => (
+                Expr::col(request_record::Column::CredentialId).into(),
+                Expr::col(request_record::Column::CredentialName).into(),
+            ),
             Self::ApiKey => (
-                "COALESCE(api_key_id, 'system')",
-                "COALESCE(api_key_name, 'system/admin')",
+                Expr::col(request_record::Column::ApiKeyId).if_null("system"),
+                Expr::col(request_record::Column::ApiKeyName).if_null("system/admin"),
             ),
             Self::Model => (
-                "COALESCE(requested_model, 'unknown')",
-                "COALESCE(requested_model, 'unknown')",
+                Expr::col(request_record::Column::RequestedModel).if_null("unknown"),
+                Expr::col(request_record::Column::RequestedModel).if_null("unknown"),
             ),
-            Self::Path => (
-                "request_method || ' ' || request_path",
-                "request_method || ' ' || request_path",
+            Self::Path => (path_expression(), path_expression()),
+            Self::Transport => (
+                Expr::col(request_record::Column::Transport).into(),
+                Expr::col(request_record::Column::Transport).into(),
             ),
-            Self::Transport => ("transport", "transport"),
             Self::StatusCode => (
-                "COALESCE(CAST(upstream_status_code AS TEXT), 'unknown')",
-                "COALESCE(CAST(upstream_status_code AS TEXT), 'unknown')",
+                Expr::expr(Func::cast_as(
+                    Expr::col(request_record::Column::UpstreamStatusCode),
+                    Alias::new("TEXT"),
+                ))
+                .if_null("unknown"),
+                Expr::expr(Func::cast_as(
+                    Expr::col(request_record::Column::UpstreamStatusCode),
+                    Alias::new("TEXT"),
+                ))
+                .if_null("unknown"),
             ),
             Self::ErrorPhase => (
-                "COALESCE(error_phase, 'unknown')",
-                "COALESCE(error_phase, 'unknown')",
+                Expr::col(request_record::Column::ErrorPhase).if_null("unknown"),
+                Expr::col(request_record::Column::ErrorPhase).if_null("unknown"),
             ),
         }
     }
@@ -817,38 +839,51 @@ async fn request_stats_with_scope(
     api_key_id: Option<&str>,
     only_failures: bool,
 ) -> Result<RequestStatsSummaryView, AppError> {
-    let (where_clause, values) = build_where_clause(credential_id, api_key_id, only_failures);
-    let sql = format!(
-        r#"
-        SELECT
-            COUNT(*) AS total_request_count,
-            SUM(CASE WHEN request_success = 1 THEN 1 ELSE 0 END) AS success_request_count,
-            SUM(CASE WHEN request_success = 0 THEN 1 ELSE 0 END) AS failure_request_count,
-            SUM(CASE WHEN transport = 'http' THEN 1 ELSE 0 END) AS http_request_count,
-            SUM(CASE WHEN transport = 'websocket' THEN 1 ELSE 0 END) AS websocket_request_count,
-            MIN(request_started_at) AS first_request_at,
-            MAX(request_started_at) AS last_request_at,
-            MAX(CASE WHEN request_success = 1 THEN COALESCE(request_completed_at, request_started_at) END) AS last_success_at,
-            MAX(CASE WHEN request_success = 0 THEN COALESCE(request_completed_at, request_started_at) END) AS last_failure_at,
-            SUM(input_tokens) AS input_tokens,
-            SUM(cached_input_tokens) AS cached_input_tokens,
-            SUM(output_tokens) AS output_tokens,
-            SUM(reasoning_output_tokens) AS reasoning_output_tokens,
-            SUM(total_tokens) AS total_tokens
-        FROM request_records
-        {where_clause}
-        "#,
-    );
-
-    let row = RequestStatsAggregateRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        sql,
-        values,
-    ))
-    .one(state.db())
-    .await
-    .map_err(|err| AppError::internal(err.to_string()))?
-    .unwrap_or_default();
+    let row = scoped_request_record_query(credential_id, api_key_id, only_failures)
+        .select_only()
+        .column_as(request_record::Column::Id.count(), "total_request_count")
+        .expr_as(
+            conditional_count_expr(Expr::col(request_record::Column::RequestSuccess).eq(true)),
+            "success_request_count",
+        )
+        .expr_as(
+            conditional_count_expr(Expr::col(request_record::Column::RequestSuccess).eq(false)),
+            "failure_request_count",
+        )
+        .expr_as(
+            conditional_count_expr(Expr::col(request_record::Column::Transport).eq("http")),
+            "http_request_count",
+        )
+        .expr_as(
+            conditional_count_expr(Expr::col(request_record::Column::Transport).eq("websocket")),
+            "websocket_request_count",
+        )
+        .column_as(
+            request_record::Column::RequestStartedAt.min(),
+            "first_request_at",
+        )
+        .column_as(
+            request_record::Column::RequestStartedAt.max(),
+            "last_request_at",
+        )
+        .expr_as(success_timestamp_expr(true), "last_success_at")
+        .expr_as(success_timestamp_expr(false), "last_failure_at")
+        .column_as(request_record::Column::InputTokens.sum(), "input_tokens")
+        .column_as(
+            request_record::Column::CachedInputTokens.sum(),
+            "cached_input_tokens",
+        )
+        .column_as(request_record::Column::OutputTokens.sum(), "output_tokens")
+        .column_as(
+            request_record::Column::ReasoningOutputTokens.sum(),
+            "reasoning_output_tokens",
+        )
+        .column_as(request_record::Column::TotalTokens.sum(), "total_tokens")
+        .into_model::<RequestStatsAggregateRow>()
+        .one(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?
+        .unwrap_or_default();
 
     Ok(RequestStatsSummaryView::from_aggregate(row))
 }
@@ -859,26 +894,18 @@ async fn duration_stats_with_scope(
     api_key_id: Option<&str>,
     only_failures: bool,
 ) -> Result<RequestDurationStatsView, AppError> {
-    let (where_clause, values) = build_where_clause(credential_id, api_key_id, only_failures);
-    let sql = format!(
-        r#"
-        SELECT
-            AVG(duration_ms) AS average_duration_ms,
-            MAX(duration_ms) AS max_duration_ms
-        FROM request_records
-        {where_clause}
-        "#
-    );
-
-    let row = RequestDurationAggregateRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        sql,
-        values,
-    ))
-    .one(state.db())
-    .await
-    .map_err(|err| AppError::internal(err.to_string()))?
-    .unwrap_or_default();
+    let row = scoped_request_record_query(credential_id, api_key_id, only_failures)
+        .select_only()
+        .expr_as(
+            Func::avg(Expr::col(request_record::Column::DurationMs)),
+            "average_duration_ms",
+        )
+        .column_as(request_record::Column::DurationMs.max(), "max_duration_ms")
+        .into_model::<RequestDurationAggregateRow>()
+        .one(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?
+        .unwrap_or_default();
 
     Ok(RequestDurationStatsView::from_aggregate(row))
 }
@@ -890,35 +917,36 @@ async fn usage_time_buckets_with_scope(
     only_failures: bool,
     bucket: TimeBucket,
 ) -> Result<Vec<UsageTimeBucketView>, AppError> {
-    let (where_clause, values) = build_where_clause(credential_id, api_key_id, only_failures);
     let bucket_expr = bucket.expression();
-    let sql = format!(
-        r#"
-        SELECT
-            {bucket_expr} AS bucket,
-            COUNT(*) AS total_request_count,
-            SUM(CASE WHEN request_success = 1 THEN 1 ELSE 0 END) AS success_request_count,
-            SUM(CASE WHEN request_success = 0 THEN 1 ELSE 0 END) AS failure_request_count,
-            SUM(input_tokens) AS input_tokens,
-            SUM(cached_input_tokens) AS cached_input_tokens,
-            SUM(output_tokens) AS output_tokens,
-            SUM(reasoning_output_tokens) AS reasoning_output_tokens,
-            SUM(total_tokens) AS total_tokens
-        FROM request_records
-        {where_clause}
-        GROUP BY {bucket_expr}
-        ORDER BY {bucket_expr} ASC
-        "#
-    );
-
-    let rows = UsageTimeBucketRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        sql,
-        values,
-    ))
-    .all(state.db())
-    .await
-    .map_err(|err| AppError::internal(err.to_string()))?;
+    let rows = scoped_request_record_query(credential_id, api_key_id, only_failures)
+        .select_only()
+        .expr_as(bucket_expr.clone(), "bucket")
+        .column_as(request_record::Column::Id.count(), "total_request_count")
+        .expr_as(
+            conditional_count_expr(Expr::col(request_record::Column::RequestSuccess).eq(true)),
+            "success_request_count",
+        )
+        .expr_as(
+            conditional_count_expr(Expr::col(request_record::Column::RequestSuccess).eq(false)),
+            "failure_request_count",
+        )
+        .column_as(request_record::Column::InputTokens.sum(), "input_tokens")
+        .column_as(
+            request_record::Column::CachedInputTokens.sum(),
+            "cached_input_tokens",
+        )
+        .column_as(request_record::Column::OutputTokens.sum(), "output_tokens")
+        .column_as(
+            request_record::Column::ReasoningOutputTokens.sum(),
+            "reasoning_output_tokens",
+        )
+        .column_as(request_record::Column::TotalTokens.sum(), "total_tokens")
+        .group_by(bucket_expr.clone())
+        .order_by_asc(bucket_expr)
+        .into_model::<UsageTimeBucketRow>()
+        .all(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
 
     Ok(rows
         .into_iter()
@@ -939,41 +967,50 @@ async fn request_breakdown_with_scope(
 ) -> Result<Vec<RequestBreakdownView>, AppError> {
     let (group_key_expr, group_label_expr) = dimension.expressions();
     let force_failures = only_failures || dimension.forces_failure_scope();
-    let (where_clause, mut values) = build_where_clause(credential_id, api_key_id, force_failures);
-    values.push((limit as i64).into());
 
-    let sql = format!(
-        r#"
-        SELECT
-            {group_key_expr} AS group_key,
-            {group_label_expr} AS group_label,
-            COUNT(*) AS total_request_count,
-            SUM(CASE WHEN request_success = 1 THEN 1 ELSE 0 END) AS success_request_count,
-            SUM(CASE WHEN request_success = 0 THEN 1 ELSE 0 END) AS failure_request_count,
-            MAX(request_started_at) AS last_request_at,
-            AVG(duration_ms) AS average_duration_ms,
-            MAX(duration_ms) AS max_duration_ms,
-            SUM(input_tokens) AS input_tokens,
-            SUM(cached_input_tokens) AS cached_input_tokens,
-            SUM(output_tokens) AS output_tokens,
-            SUM(reasoning_output_tokens) AS reasoning_output_tokens,
-            SUM(total_tokens) AS total_tokens
-        FROM request_records
-        {where_clause}
-        GROUP BY {group_key_expr}, {group_label_expr}
-        ORDER BY total_request_count DESC, total_tokens DESC, group_label ASC
-        LIMIT ?
-        "#
-    );
-
-    let rows = RequestBreakdownRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        sql,
-        values,
-    ))
-    .all(state.db())
-    .await
-    .map_err(|err| AppError::internal(err.to_string()))?;
+    let rows = scoped_request_record_query(credential_id, api_key_id, force_failures)
+        .select_only()
+        .expr_as(group_key_expr.clone(), "group_key")
+        .expr_as(group_label_expr.clone(), "group_label")
+        .column_as(request_record::Column::Id.count(), "total_request_count")
+        .expr_as(
+            conditional_count_expr(Expr::col(request_record::Column::RequestSuccess).eq(true)),
+            "success_request_count",
+        )
+        .expr_as(
+            conditional_count_expr(Expr::col(request_record::Column::RequestSuccess).eq(false)),
+            "failure_request_count",
+        )
+        .column_as(
+            request_record::Column::RequestStartedAt.max(),
+            "last_request_at",
+        )
+        .expr_as(
+            Func::avg(Expr::col(request_record::Column::DurationMs)),
+            "average_duration_ms",
+        )
+        .column_as(request_record::Column::DurationMs.max(), "max_duration_ms")
+        .column_as(request_record::Column::InputTokens.sum(), "input_tokens")
+        .column_as(
+            request_record::Column::CachedInputTokens.sum(),
+            "cached_input_tokens",
+        )
+        .column_as(request_record::Column::OutputTokens.sum(), "output_tokens")
+        .column_as(
+            request_record::Column::ReasoningOutputTokens.sum(),
+            "reasoning_output_tokens",
+        )
+        .column_as(request_record::Column::TotalTokens.sum(), "total_tokens")
+        .group_by(group_key_expr)
+        .group_by(group_label_expr)
+        .order_by_desc(Expr::col(Alias::new("total_request_count")))
+        .order_by_desc(Expr::col(Alias::new("total_tokens")))
+        .order_by_asc(Expr::col(Alias::new("group_label")))
+        .limit(limit.max(1))
+        .into_model::<RequestBreakdownRow>()
+        .all(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
 
     Ok(rows
         .into_iter()
@@ -1041,33 +1078,44 @@ async fn latest_request_errors_with_scope(
         .collect())
 }
 
-fn build_where_clause(
+fn scoped_request_record_query(
     credential_id: Option<&str>,
     api_key_id: Option<&str>,
     only_failures: bool,
-) -> (String, Vec<SeaValue>) {
-    let mut clauses = Vec::new();
-    let mut values = Vec::new();
-
+) -> Select<request_record::Entity> {
+    let mut select = request_record::Entity::find();
     if let Some(credential_id) = credential_id {
-        clauses.push("credential_id = ?".to_string());
-        values.push(credential_id.to_string().into());
+        select = select.filter(request_record::Column::CredentialId.eq(credential_id.to_string()));
     }
     if let Some(api_key_id) = api_key_id {
-        clauses.push("api_key_id = ?".to_string());
-        values.push(api_key_id.to_string().into());
+        select = select.filter(request_record::Column::ApiKeyId.eq(api_key_id.to_string()));
     }
     if only_failures {
-        clauses.push("request_success = 0".to_string());
+        select = select.filter(request_record::Column::RequestSuccess.eq(false));
     }
+    select
+}
 
-    let where_clause = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", clauses.join(" AND "))
-    };
+fn conditional_count_expr(condition: SimpleExpr) -> SimpleExpr {
+    Func::sum(Expr::case(Condition::all().add(condition), 1).finally(0)).into()
+}
 
-    (where_clause, values)
+fn success_timestamp_expr(success: bool) -> SimpleExpr {
+    Func::max(Expr::case(
+        Condition::all().add(Expr::col(request_record::Column::RequestSuccess).eq(success)),
+        Expr::col(request_record::Column::RequestCompletedAt)
+            .if_null(Expr::col(request_record::Column::RequestStartedAt)),
+    ))
+    .into()
+}
+
+fn path_expression() -> SimpleExpr {
+    Expr::col(request_record::Column::RequestMethod)
+        .binary(BinOper::Custom("||"), Expr::val(" "))
+        .binary(
+            BinOper::Custom("||"),
+            Expr::col(request_record::Column::RequestPath),
+        )
 }
 
 fn process_sse_frame(frame: &str, observation: &mut RequestObservation) {
@@ -1140,7 +1188,10 @@ fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
     let output_tokens = extract_token_count(value, &["output_tokens", "completion_tokens"])?;
     let cached_input_tokens = extract_nested_token_count(
         value,
-        &[("input_tokens_details", "cached_tokens"), ("prompt_tokens_details", "cached_tokens")],
+        &[
+            ("input_tokens_details", "cached_tokens"),
+            ("prompt_tokens_details", "cached_tokens"),
+        ],
     )
     .unwrap_or(0);
     let reasoning_output_tokens = extract_nested_token_count(
@@ -1175,10 +1226,7 @@ fn extract_token_count(value: &Value, field_names: &[&str]) -> Option<i64> {
         .find_map(|field_name| value.get(field_name).and_then(Value::as_i64))
 }
 
-fn extract_nested_token_count(
-    value: &Value,
-    field_names: &[(&str, &str)],
-) -> Option<i64> {
+fn extract_nested_token_count(value: &Value, field_names: &[(&str, &str)]) -> Option<i64> {
     field_names.iter().find_map(|(object_name, field_name)| {
         value
             .get(*object_name)

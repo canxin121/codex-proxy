@@ -21,12 +21,15 @@ use sea_orm::ColumnTrait;
 use sea_orm::ConnectionTrait;
 use sea_orm::Database;
 use sea_orm::DatabaseConnection;
-use sea_orm::DbBackend;
 use sea_orm::EntityTrait;
 use sea_orm::QueryFilter;
 use sea_orm::QueryOrder;
 use sea_orm::Set;
-use sea_orm::Statement;
+use sea_orm::sea_query::Alias;
+use sea_orm::sea_query::ColumnDef;
+use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::Index;
+use sea_orm::sea_query::Table;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -860,124 +863,385 @@ pub async fn credential_view_material(
 }
 
 async fn initialize_database(db: &DatabaseConnection) -> Result<(), AppError> {
-    let backend = DbBackend::Sqlite;
-    let statements = [
-        r#"
-        CREATE TABLE IF NOT EXISTS credentials (
-            id TEXT PRIMARY KEY NOT NULL,
-            name TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            enabled INTEGER NOT NULL,
-            selection_weight INTEGER NOT NULL DEFAULT 1,
-            notes TEXT NULL,
-            upstream_base_url TEXT NULL,
-            account_id TEXT NULL,
-            account_email TEXT NULL,
-            plan_type TEXT NULL,
-            last_used_at TEXT NULL,
-            last_limit_sync_at TEXT NULL,
-            last_refresh_at TEXT NULL,
-            last_error TEXT NULL,
-            failure_count INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        "#,
-        r#"
-        CREATE TABLE IF NOT EXISTS credential_limits (
-            id TEXT PRIMARY KEY NOT NULL,
-            credential_id TEXT NOT NULL,
-            limit_id TEXT NOT NULL,
-            limit_name TEXT NULL,
-            primary_used_percent REAL NULL,
-            primary_window_minutes INTEGER NULL,
-            primary_resets_at TEXT NULL,
-            secondary_used_percent REAL NULL,
-            secondary_window_minutes INTEGER NULL,
-            secondary_resets_at TEXT NULL,
-            has_credits INTEGER NULL,
-            unlimited INTEGER NULL,
-            balance TEXT NULL,
-            plan_type TEXT NULL,
-            updated_at TEXT NOT NULL
-        )
-        "#,
-        r#"
-        CREATE TABLE IF NOT EXISTS api_keys (
-            id TEXT PRIMARY KEY NOT NULL,
-            name TEXT NOT NULL,
-            key_hash TEXT NOT NULL UNIQUE,
-            enabled INTEGER NOT NULL,
-            is_admin INTEGER NOT NULL,
-            expires_at TEXT NULL,
-            last_used_at TEXT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        "#,
-        r#"
-        CREATE TABLE IF NOT EXISTS auth_sessions (
-            id TEXT PRIMARY KEY NOT NULL,
-            credential_id TEXT NOT NULL,
-            method TEXT NOT NULL,
-            status TEXT NOT NULL,
-            authorization_url TEXT NULL,
-            redirect_uri TEXT NULL,
-            oauth_state TEXT NULL,
-            pkce_code_verifier TEXT NULL,
-            verification_url TEXT NULL,
-            user_code TEXT NULL,
-            device_auth_id TEXT NULL,
-            device_code_interval_seconds INTEGER NULL,
-            error_message TEXT NULL,
-            completed_at TEXT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        "#,
-        r#"
-        CREATE TABLE IF NOT EXISTS request_records (
-            id TEXT PRIMARY KEY NOT NULL,
-            credential_id TEXT NOT NULL,
-            credential_name TEXT NOT NULL,
-            api_key_id TEXT NULL,
-            api_key_name TEXT NULL,
-            principal_kind TEXT NOT NULL,
-            transport TEXT NOT NULL,
-            request_method TEXT NOT NULL,
-            request_path TEXT NOT NULL,
-            upstream_status_code INTEGER NULL,
-            request_success INTEGER NULL,
-            error_phase TEXT NULL,
-            error_code TEXT NULL,
-            error_message TEXT NULL,
-            response_id TEXT NULL,
-            requested_model TEXT NULL,
-            input_tokens INTEGER NOT NULL DEFAULT 0,
-            cached_input_tokens INTEGER NOT NULL DEFAULT 0,
-            output_tokens INTEGER NOT NULL DEFAULT 0,
-            reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
-            total_tokens INTEGER NOT NULL DEFAULT 0,
-            usage_json TEXT NULL,
-            request_started_at TEXT NOT NULL,
-            request_completed_at TEXT NULL,
-            duration_ms INTEGER NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        "#,
-        r#"CREATE INDEX IF NOT EXISTS idx_credentials_enabled ON credentials(enabled)"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_credential_limits_credential_id ON credential_limits(credential_id)"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_auth_sessions_credential_id ON auth_sessions(credential_id)"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_auth_sessions_status ON auth_sessions(status)"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_request_records_credential_id ON request_records(credential_id)"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_request_records_api_key_id ON request_records(api_key_id)"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_request_records_success ON request_records(request_success)"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_request_records_started_at ON request_records(request_started_at)"#,
+    let backend = db.get_database_backend();
+    let credentials_table = Alias::new("credentials");
+    let credential_limits_table = Alias::new("credential_limits");
+    let api_keys_table = Alias::new("api_keys");
+    let auth_sessions_table = Alias::new("auth_sessions");
+    let request_records_table = Alias::new("request_records");
+
+    let statements = vec![
+        backend.build(
+            &Table::create()
+                .if_not_exists()
+                .table(credentials_table.clone())
+                .col(
+                    ColumnDef::new(credential::Column::Id)
+                        .string()
+                        .not_null()
+                        .primary_key(),
+                )
+                .col(ColumnDef::new(credential::Column::Name).string().not_null())
+                .col(ColumnDef::new(credential::Column::Kind).string().not_null())
+                .col(
+                    ColumnDef::new(credential::Column::Enabled)
+                        .boolean()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(credential::Column::SelectionWeight)
+                        .integer()
+                        .not_null()
+                        .default(1),
+                )
+                .col(ColumnDef::new(credential::Column::Notes).string())
+                .col(ColumnDef::new(credential::Column::UpstreamBaseUrl).string())
+                .col(ColumnDef::new(credential::Column::AccountId).string())
+                .col(ColumnDef::new(credential::Column::AccountEmail).string())
+                .col(ColumnDef::new(credential::Column::PlanType).string())
+                .col(ColumnDef::new(credential::Column::LastUsedAt).date_time())
+                .col(ColumnDef::new(credential::Column::LastLimitSyncAt).date_time())
+                .col(ColumnDef::new(credential::Column::LastRefreshAt).date_time())
+                .col(ColumnDef::new(credential::Column::LastError).string())
+                .col(
+                    ColumnDef::new(credential::Column::FailureCount)
+                        .integer()
+                        .not_null()
+                        .default(0),
+                )
+                .col(
+                    ColumnDef::new(credential::Column::CreatedAt)
+                        .date_time()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(credential::Column::UpdatedAt)
+                        .date_time()
+                        .not_null(),
+                )
+                .to_owned(),
+        ),
+        backend.build(
+            &Table::create()
+                .if_not_exists()
+                .table(credential_limits_table.clone())
+                .col(
+                    ColumnDef::new(credential_limit::Column::Id)
+                        .string()
+                        .not_null()
+                        .primary_key(),
+                )
+                .col(
+                    ColumnDef::new(credential_limit::Column::CredentialId)
+                        .string()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(credential_limit::Column::LimitId)
+                        .string()
+                        .not_null(),
+                )
+                .col(ColumnDef::new(credential_limit::Column::LimitName).string())
+                .col(ColumnDef::new(credential_limit::Column::PrimaryUsedPercent).double())
+                .col(ColumnDef::new(credential_limit::Column::PrimaryWindowMinutes).big_integer())
+                .col(ColumnDef::new(credential_limit::Column::PrimaryResetsAt).date_time())
+                .col(ColumnDef::new(credential_limit::Column::SecondaryUsedPercent).double())
+                .col(ColumnDef::new(credential_limit::Column::SecondaryWindowMinutes).big_integer())
+                .col(ColumnDef::new(credential_limit::Column::SecondaryResetsAt).date_time())
+                .col(ColumnDef::new(credential_limit::Column::HasCredits).boolean())
+                .col(ColumnDef::new(credential_limit::Column::Unlimited).boolean())
+                .col(ColumnDef::new(credential_limit::Column::Balance).string())
+                .col(ColumnDef::new(credential_limit::Column::PlanType).string())
+                .col(
+                    ColumnDef::new(credential_limit::Column::UpdatedAt)
+                        .date_time()
+                        .not_null(),
+                )
+                .to_owned(),
+        ),
+        backend.build(
+            &Table::create()
+                .if_not_exists()
+                .table(api_keys_table.clone())
+                .col(
+                    ColumnDef::new(api_key::Column::Id)
+                        .string()
+                        .not_null()
+                        .primary_key(),
+                )
+                .col(ColumnDef::new(api_key::Column::Name).string().not_null())
+                .col(
+                    ColumnDef::new(api_key::Column::KeyHash)
+                        .string()
+                        .not_null()
+                        .unique_key(),
+                )
+                .col(
+                    ColumnDef::new(api_key::Column::Enabled)
+                        .boolean()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(api_key::Column::IsAdmin)
+                        .boolean()
+                        .not_null(),
+                )
+                .col(ColumnDef::new(api_key::Column::ExpiresAt).date_time())
+                .col(ColumnDef::new(api_key::Column::LastUsedAt).date_time())
+                .col(
+                    ColumnDef::new(api_key::Column::CreatedAt)
+                        .date_time()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(api_key::Column::UpdatedAt)
+                        .date_time()
+                        .not_null(),
+                )
+                .to_owned(),
+        ),
+        backend.build(
+            &Table::create()
+                .if_not_exists()
+                .table(auth_sessions_table.clone())
+                .col(
+                    ColumnDef::new(crate::entities::auth_session::Column::Id)
+                        .string()
+                        .not_null()
+                        .primary_key(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::auth_session::Column::CredentialId)
+                        .string()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::auth_session::Column::Method)
+                        .string()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::auth_session::Column::Status)
+                        .string()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::auth_session::Column::AuthorizationUrl)
+                        .string(),
+                )
+                .col(ColumnDef::new(crate::entities::auth_session::Column::RedirectUri).string())
+                .col(ColumnDef::new(crate::entities::auth_session::Column::OauthState).string())
+                .col(
+                    ColumnDef::new(crate::entities::auth_session::Column::PkceCodeVerifier)
+                        .string(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::auth_session::Column::VerificationUrl).string(),
+                )
+                .col(ColumnDef::new(crate::entities::auth_session::Column::UserCode).string())
+                .col(ColumnDef::new(crate::entities::auth_session::Column::DeviceAuthId).string())
+                .col(
+                    ColumnDef::new(
+                        crate::entities::auth_session::Column::DeviceCodeIntervalSeconds,
+                    )
+                    .integer(),
+                )
+                .col(ColumnDef::new(crate::entities::auth_session::Column::ErrorMessage).string())
+                .col(ColumnDef::new(crate::entities::auth_session::Column::CompletedAt).date_time())
+                .col(
+                    ColumnDef::new(crate::entities::auth_session::Column::CreatedAt)
+                        .date_time()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::auth_session::Column::UpdatedAt)
+                        .date_time()
+                        .not_null(),
+                )
+                .to_owned(),
+        ),
+        backend.build(
+            &Table::create()
+                .if_not_exists()
+                .table(request_records_table.clone())
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::Id)
+                        .string()
+                        .not_null()
+                        .primary_key(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::CredentialId)
+                        .string()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::CredentialName)
+                        .string()
+                        .not_null(),
+                )
+                .col(ColumnDef::new(crate::entities::request_record::Column::ApiKeyId).string())
+                .col(ColumnDef::new(crate::entities::request_record::Column::ApiKeyName).string())
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::PrincipalKind)
+                        .string()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::Transport)
+                        .string()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::RequestMethod)
+                        .string()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::RequestPath)
+                        .string()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::UpstreamStatusCode)
+                        .integer(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::RequestSuccess)
+                        .boolean(),
+                )
+                .col(ColumnDef::new(crate::entities::request_record::Column::ErrorPhase).string())
+                .col(ColumnDef::new(crate::entities::request_record::Column::ErrorCode).string())
+                .col(ColumnDef::new(crate::entities::request_record::Column::ErrorMessage).string())
+                .col(ColumnDef::new(crate::entities::request_record::Column::ResponseId).string())
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::RequestedModel)
+                        .string(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::InputTokens)
+                        .big_integer()
+                        .not_null()
+                        .default(0_i64),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::CachedInputTokens)
+                        .big_integer()
+                        .not_null()
+                        .default(0_i64),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::OutputTokens)
+                        .big_integer()
+                        .not_null()
+                        .default(0_i64),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::ReasoningOutputTokens)
+                        .big_integer()
+                        .not_null()
+                        .default(0_i64),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::TotalTokens)
+                        .big_integer()
+                        .not_null()
+                        .default(0_i64),
+                )
+                .col(ColumnDef::new(crate::entities::request_record::Column::UsageJson).string())
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::RequestStartedAt)
+                        .date_time()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::RequestCompletedAt)
+                        .date_time(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::DurationMs)
+                        .big_integer(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::CreatedAt)
+                        .date_time()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(crate::entities::request_record::Column::UpdatedAt)
+                        .date_time()
+                        .not_null(),
+                )
+                .to_owned(),
+        ),
+        backend.build(
+            &Index::create()
+                .if_not_exists()
+                .name("idx_credentials_enabled")
+                .table(credentials_table)
+                .col(credential::Column::Enabled)
+                .to_owned(),
+        ),
+        backend.build(
+            &Index::create()
+                .if_not_exists()
+                .name("idx_credential_limits_credential_id")
+                .table(credential_limits_table)
+                .col(credential_limit::Column::CredentialId)
+                .to_owned(),
+        ),
+        backend.build(
+            &Index::create()
+                .if_not_exists()
+                .name("idx_auth_sessions_credential_id")
+                .table(auth_sessions_table.clone())
+                .col(crate::entities::auth_session::Column::CredentialId)
+                .to_owned(),
+        ),
+        backend.build(
+            &Index::create()
+                .if_not_exists()
+                .name("idx_auth_sessions_status")
+                .table(auth_sessions_table)
+                .col(crate::entities::auth_session::Column::Status)
+                .to_owned(),
+        ),
+        backend.build(
+            &Index::create()
+                .if_not_exists()
+                .name("idx_request_records_credential_id")
+                .table(request_records_table.clone())
+                .col(crate::entities::request_record::Column::CredentialId)
+                .to_owned(),
+        ),
+        backend.build(
+            &Index::create()
+                .if_not_exists()
+                .name("idx_request_records_api_key_id")
+                .table(request_records_table.clone())
+                .col(crate::entities::request_record::Column::ApiKeyId)
+                .to_owned(),
+        ),
+        backend.build(
+            &Index::create()
+                .if_not_exists()
+                .name("idx_request_records_success")
+                .table(request_records_table.clone())
+                .col(crate::entities::request_record::Column::RequestSuccess)
+                .to_owned(),
+        ),
+        backend.build(
+            &Index::create()
+                .if_not_exists()
+                .name("idx_request_records_started_at")
+                .table(request_records_table)
+                .col(crate::entities::request_record::Column::RequestStartedAt)
+                .to_owned(),
+        ),
     ];
 
-    for sql in statements {
-        db.execute(Statement::from_string(backend, sql.to_string()))
+    for statement in statements {
+        db.execute(statement)
             .await
             .map_err(|err| AppError::internal(err.to_string()))?;
     }
@@ -986,19 +1250,28 @@ async fn initialize_database(db: &DatabaseConnection) -> Result<(), AppError> {
 }
 
 async fn recover_auth_sessions(db: &DatabaseConnection) -> Result<(), AppError> {
-    let statement = Statement::from_string(
-        DbBackend::Sqlite,
-        format!(
-            "UPDATE auth_sessions \
-             SET status = 'failed', \
-                 error_message = 'service restarted before auth completed', \
-                 completed_at = CURRENT_TIMESTAMP, \
-                 updated_at = CURRENT_TIMESTAMP \
-             WHERE status = '{}'",
-            crate::models::AuthStatus::Pending.as_str()
-        ),
-    );
-    db.execute(statement)
+    crate::entities::auth_session::Entity::update_many()
+        .col_expr(
+            crate::entities::auth_session::Column::Status,
+            Expr::value(crate::models::AuthStatus::Failed.as_str()),
+        )
+        .col_expr(
+            crate::entities::auth_session::Column::ErrorMessage,
+            Expr::value("service restarted before auth completed"),
+        )
+        .col_expr(
+            crate::entities::auth_session::Column::CompletedAt,
+            Expr::current_timestamp().into(),
+        )
+        .col_expr(
+            crate::entities::auth_session::Column::UpdatedAt,
+            Expr::current_timestamp().into(),
+        )
+        .filter(
+            crate::entities::auth_session::Column::Status
+                .eq(crate::models::AuthStatus::Pending.as_str()),
+        )
+        .exec(db)
         .await
         .map_err(|err| AppError::internal(err.to_string()))?;
     Ok(())
