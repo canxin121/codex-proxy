@@ -3,50 +3,156 @@ import { computed, onMounted, ref } from 'vue'
 import {
   NButton,
   NCard,
+  NCollapse,
+  NCollapseItem,
   NEmpty,
   NGrid,
   NGridItem,
   NIcon,
-  NProgress,
   NSkeleton,
   NSpace,
   NTag,
   NThing,
 } from 'naive-ui'
 import { RefreshOutline } from '@vicons/ionicons5'
+import BreakdownList from '@/components/BreakdownList.vue'
 import MetricCard from '@/components/MetricCard.vue'
 import TokenUsageStrip from '@/components/TokenUsageStrip.vue'
+import TrendAreaChart from '@/components/TrendAreaChart.vue'
 import { api } from '@/api/service'
-import type { ApiKeyView, CredentialView, StatsOverviewView } from '@/api/types'
+import type {
+  ApiKeyView,
+  CredentialModelBreakdownView,
+  CredentialView,
+  RequestBreakdownView,
+  StatsOverviewView,
+  UsageStatsView,
+} from '@/api/types'
 import { useSessionStore } from '@/stores/session'
 import { useAutoRefresh } from '@/composables/use-auto-refresh'
 import { formatDateTime, formatNumber, formatPercent, formatRelativeShort } from '@/utils/format'
+
+type BreakdownListItem = RequestBreakdownView & {
+  description?: string
+}
+
+type CredentialModelGroupItem = {
+  credential: BreakdownListItem
+  models: BreakdownListItem[]
+}
 
 const session = useSessionStore()
 const loading = ref(false)
 const errorMessage = ref('')
 const overview = ref<StatsOverviewView | null>(null)
+const usage = ref<UsageStatsView | null>(null)
 const credentials = ref<CredentialView[]>([])
 const apiKeys = ref<ApiKeyView[]>([])
 
-const successRate = computed(() => {
-  const current = overview.value
-  if (!current || current.request_stats.total_request_count === 0) {
-    return '0%'
-  }
-  return `${((current.request_stats.success_request_count / current.request_stats.total_request_count) * 100).toFixed(1)}%`
-})
-
-const topCredentials = computed(() =>
-  [...credentials.value]
-    .sort((left, right) => right.request_stats.total_request_count - left.request_stats.total_request_count)
-    .slice(0, 5),
+const credentialMap = computed(
+  () => new Map(credentials.value.map((item) => [item.credential_id, item] as const)),
 )
 
-const topApiKeys = computed(() =>
-  [...apiKeys.value]
-    .sort((left, right) => right.request_stats.total_request_count - left.request_stats.total_request_count)
-    .slice(0, 5),
+const apiKeyMap = computed(
+  () => new Map(apiKeys.value.map((item) => [item.api_key_id, item] as const)),
+)
+
+const successRate = computed(() => {
+  const current = usage.value?.summary
+  if (!current || current.total_request_count === 0) {
+    return '0%'
+  }
+  return formatPercent((current.success_request_count / current.total_request_count) * 100)
+})
+
+const dailyRequestSeries = computed(() =>
+  (usage.value?.daily ?? []).slice(-14).map((item) => ({
+    label: item.bucket.slice(5),
+    value: item.total_request_count,
+  })),
+)
+
+const hourlyRequestSeries = computed(() =>
+  (usage.value?.hourly ?? []).map((item) => ({
+    label: item.bucket,
+    value: item.total_request_count,
+  })),
+)
+
+const dailyTokenSeries = computed(() =>
+  (usage.value?.daily ?? []).slice(-14).map((item) => ({
+    label: item.bucket.slice(5),
+    value: item.token_usage.all_tokens,
+  })),
+)
+
+const hourlyTokenSeries = computed(() =>
+  (usage.value?.hourly ?? []).map((item) => ({
+    label: item.bucket,
+    value: item.token_usage.all_tokens,
+  })),
+)
+
+function credentialDescription(credentialId: string) {
+  const meta = credentialMap.value.get(credentialId)
+  return meta?.chatgpt_account_email ?? meta?.chatgpt_account_id ?? meta?.chatgpt_plan_type ?? '未同步账号信息'
+}
+
+function mapCredentialModelGroup(group: CredentialModelBreakdownView): CredentialModelGroupItem {
+  return {
+    credential: {
+      ...group.credential,
+      description: credentialDescription(group.credential.key),
+    },
+    models: group.models.map((item) => ({
+      ...item,
+      description: `输出 ${formatNumber(item.token_usage.write_output_tokens)} · 推理 ${formatNumber(item.token_usage.write_reasoning_tokens)}`,
+    })),
+  }
+}
+
+const credentialModelGroups = computed<CredentialModelGroupItem[]>(() =>
+  (usage.value?.credential_model_groups ?? []).slice(0, 6).map(mapCredentialModelGroup),
+)
+
+const topApiKeys = computed<BreakdownListItem[]>(() =>
+  (usage.value?.api_keys ?? []).slice(0, 6).map((item) => {
+    const meta = apiKeyMap.value.get(item.key)
+    return {
+      ...item,
+      description: meta
+        ? `${meta.has_admin_access ? 'Admin' : 'Client'}${meta.api_key_expires_at ? ` · 过期于 ${formatDateTime(meta.api_key_expires_at)}` : ''}`
+        : 'system/admin',
+    }
+  }),
+)
+
+const topModels = computed<BreakdownListItem[]>(() =>
+  (usage.value?.models ?? []).slice(0, 6).map((item) => ({
+    ...item,
+    description: `输出 ${formatNumber(item.token_usage.write_output_tokens)} · 推理 ${formatNumber(item.token_usage.write_reasoning_tokens)}`,
+  })),
+)
+
+const busiestPaths = computed<BreakdownListItem[]>(() =>
+  (usage.value?.paths ?? []).slice(0, 6).map((item) => ({
+    ...item,
+    description: `输入 ${formatNumber(item.token_usage.read_input_tokens)} · 缓存 ${formatNumber(item.token_usage.cache_read_input_tokens)}`,
+  })),
+)
+
+const statusCodes = computed<BreakdownListItem[]>(() =>
+  (usage.value?.status_codes ?? []).slice(0, 6).map((item) => ({
+    ...item,
+    description: item.label === 'unknown' ? '上游没有返回状态码' : '按状态码聚合',
+  })),
+)
+
+const errorPhases = computed<BreakdownListItem[]>(() =>
+  (usage.value?.error_phases ?? []).slice(0, 6).map((item) => ({
+    ...item,
+    description: item.label === 'unknown' ? '没有记录错误阶段' : '失败请求阶段分布',
+  })),
 )
 
 async function load() {
@@ -56,12 +162,14 @@ async function load() {
   loading.value = true
   errorMessage.value = ''
   try {
-    const [overviewResponse, credentialResponse, apiKeyResponse] = await Promise.all([
+    const [overviewResponse, usageResponse, credentialResponse, apiKeyResponse] = await Promise.all([
       api.getStatsOverview(session.apiContext),
+      api.getUsageStats(session.apiContext, { top: 8 }),
       api.listCredentials(session.apiContext),
       api.listApiKeys(session.apiContext),
     ])
     overview.value = overviewResponse
+    usage.value = usageResponse
     credentials.value = credentialResponse
     apiKeys.value = apiKeyResponse
   } catch (error) {
@@ -87,9 +195,9 @@ onMounted(() => {
     <div class="page-head">
       <div>
         <div class="page-kicker">Proxy Telemetry</div>
-        <h1 class="page-title display-font">全局负载、认证和失败面板</h1>
+        <h1 class="page-title display-font">按时间、凭证、模型展开的全局统计面板</h1>
         <p class="page-subtitle">
-          这里汇总所有凭证、API key 和最近失败请求，适合快速判断当前池子是否健康、有没有卡在限额边缘。
+          这里直接对齐 `CLIProxyAPI` 的统计思路，把请求量、token、失败阶段、状态码和热点路径都拉成可读的趋势和分布，而不是只看总数。
         </p>
       </div>
       <n-button secondary type="primary" :loading="loading" @click="load">
@@ -102,19 +210,19 @@ onMounted(() => {
 
     <p v-if="errorMessage" class="page-error">{{ errorMessage }}</p>
 
-    <template v-if="loading && !overview">
+    <template v-if="loading && (!overview || !usage)">
       <div class="skeleton-grid">
         <n-skeleton v-for="item in 4" :key="item" height="160px" class="app-shell-card" />
       </div>
     </template>
 
-    <template v-else-if="overview">
+    <template v-else-if="overview && usage">
       <n-grid cols="1 s:2 xl:4" responsive="screen" :x-gap="18" :y-gap="18">
         <n-grid-item>
           <metric-card
             title="活跃请求"
             :value="formatNumber(overview.active_request_count)"
-            note="当前所有凭证上的进行中请求总数"
+            note="当前正在占用凭证的请求总数"
             tone="accent"
           />
         </n-grid-item>
@@ -122,7 +230,7 @@ onMounted(() => {
           <metric-card
             title="认证凭证"
             :value="`${formatNumber(overview.authenticated_credential_count)} / ${formatNumber(overview.enabled_credential_count)}`"
-            note="已可用认证数 / 已启用凭证数"
+            :note="`${formatNumber(overview.pending_auth_session_count)} 个待完成 Auth 会话`"
             tone="success"
           />
         </n-grid-item>
@@ -130,15 +238,14 @@ onMounted(() => {
           <metric-card
             title="请求成功率"
             :value="successRate"
-            :note="`${formatNumber(overview.request_stats.success_request_count)} 成功 / ${formatNumber(overview.request_stats.failure_request_count)} 失败`"
-            tone="default"
+            :note="`${formatNumber(usage.summary.total_request_count)} 次请求，失败 ${formatNumber(usage.summary.failure_request_count)} 次`"
           />
         </n-grid-item>
         <n-grid-item>
           <metric-card
-            title="API Keys"
-            :value="`${formatNumber(overview.enabled_api_key_count)} / ${formatNumber(overview.total_api_key_count)}`"
-            :note="`${formatNumber(overview.pending_auth_session_count)} 个待完成 Auth 会话`"
+            title="Token 总量"
+            :value="formatNumber(usage.summary.token_usage.all_tokens)"
+            :note="`${formatNumber(overview.enabled_api_key_count)} / ${formatNumber(overview.total_api_key_count)} 个 API Key 已启用`"
             tone="danger"
           />
         </n-grid-item>
@@ -148,76 +255,156 @@ onMounted(() => {
         <template #header>
           <div class="section-headline">
             <div>
-              <div class="section-title">Token 消耗横截面</div>
+              <div class="section-title">Token 结构总览</div>
               <div class="section-note">
-                最近一次汇总生成于 {{ formatDateTime(overview.generated_at) }}
+                汇总生成于 {{ formatDateTime(usage.generated_at) }}，统计范围覆盖所有请求记录
               </div>
             </div>
             <n-tag round type="info">
-              共 {{ formatNumber(overview.request_stats.total_request_count) }} 次请求
+              总请求 {{ formatNumber(usage.summary.total_request_count) }}
             </n-tag>
           </div>
         </template>
-        <token-usage-strip :usage="overview.request_stats.token_usage" />
+        <token-usage-strip :usage="usage.summary.token_usage" />
       </n-card>
 
       <n-grid cols="1 xl:2" responsive="screen" :x-gap="18" :y-gap="18">
         <n-grid-item>
-          <n-card class="section-card app-shell-card" :bordered="false" title="最忙凭证">
-            <template v-if="topCredentials.length">
-              <div v-for="credential in topCredentials" :key="credential.credential_id" class="rank-row">
-                <div class="rank-row__main">
-                  <div class="rank-row__title">{{ credential.credential_name }}</div>
-                  <div class="rank-row__meta">
-                    {{ credential.chatgpt_account_email ?? credential.chatgpt_account_id ?? '未同步账号信息' }}
-                  </div>
-                </div>
-                <div class="rank-row__stats">
-                  <span>{{ formatNumber(credential.request_stats.total_request_count) }} 次</span>
-                  <n-progress
-                    type="line"
-                    :show-indicator="false"
-                    :percentage="
-                      credential.request_stats.total_request_count === 0 || overview.request_stats.total_request_count === 0
-                        ? 0
-                        : (credential.request_stats.total_request_count / overview.request_stats.total_request_count) * 100
-                    "
-                  />
+          <n-card class="section-card app-shell-card" :bordered="false">
+            <template #header>
+              <div class="section-headline">
+                <div>
+                  <div class="section-title">按天请求趋势</div>
+                  <div class="section-note">最近 14 个自然日的请求量</div>
                 </div>
               </div>
             </template>
-            <n-empty v-else description="没有凭证数据" />
+            <trend-area-chart :items="dailyRequestSeries" />
           </n-card>
         </n-grid-item>
-
         <n-grid-item>
-          <n-card class="section-card app-shell-card" :bordered="false" title="最忙 API Key">
-            <template v-if="topApiKeys.length">
-              <div v-for="apiKey in topApiKeys" :key="apiKey.api_key_id" class="rank-row">
-                <div class="rank-row__main">
-                  <div class="rank-row__title">{{ apiKey.api_key_name }}</div>
-                  <div class="rank-row__meta">
-                    {{ apiKey.has_admin_access ? 'Admin' : 'Client' }}
-                    <template v-if="apiKey.api_key_expires_at">
-                      · 过期于 {{ formatDateTime(apiKey.api_key_expires_at) }}
-                    </template>
-                  </div>
-                </div>
-                <div class="rank-row__stats">
-                  <span>{{ formatNumber(apiKey.request_stats.total_request_count) }} 次</span>
-                  <n-progress
-                    type="line"
-                    :show-indicator="false"
-                    :percentage="
-                      apiKey.request_stats.total_request_count === 0 || overview.request_stats.total_request_count === 0
-                        ? 0
-                        : (apiKey.request_stats.total_request_count / overview.request_stats.total_request_count) * 100
-                    "
-                  />
+          <n-card class="section-card app-shell-card" :bordered="false">
+            <template #header>
+              <div class="section-headline">
+                <div>
+                  <div class="section-title">全天时段请求分布</div>
+                  <div class="section-note">把全量请求压到 24 个小时刻度里看峰谷</div>
                 </div>
               </div>
             </template>
-            <n-empty v-else description="没有 API key 数据" />
+            <trend-area-chart :items="hourlyRequestSeries" stroke="#ad6b1f" />
+          </n-card>
+        </n-grid-item>
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false">
+            <template #header>
+              <div class="section-headline">
+                <div>
+                  <div class="section-title">按天 Token 趋势</div>
+                  <div class="section-note">最近 14 个自然日的 token 消耗</div>
+                </div>
+              </div>
+            </template>
+            <trend-area-chart :items="dailyTokenSeries" compact stroke="#0f6a58" />
+          </n-card>
+        </n-grid-item>
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false">
+            <template #header>
+              <div class="section-headline">
+                <div>
+                  <div class="section-title">全天时段 Token 分布</div>
+                  <div class="section-note">观察哪个时段最吃 token</div>
+                </div>
+              </div>
+            </template>
+            <trend-area-chart :items="hourlyTokenSeries" compact stroke="#b4493f" />
+          </n-card>
+        </n-grid-item>
+      </n-grid>
+
+      <n-grid cols="1 xl:2" responsive="screen" :x-gap="18" :y-gap="18">
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false" title="最忙凭证 / Model 子分组">
+            <template v-if="credentialModelGroups.length">
+              <n-collapse arrow-placement="right">
+                <n-collapse-item
+                  v-for="group in credentialModelGroups"
+                  :key="group.credential.key"
+                  :name="group.credential.key"
+                >
+                  <template #header>
+                    <div class="credential-group__header">
+                      <div class="credential-group__title">{{ group.credential.label }}</div>
+                      <div class="credential-group__meta">
+                        {{ group.credential.description }}
+                        · {{ formatNumber(group.credential.total_request_count) }} 次
+                        · {{ formatPercent((group.credential.success_request_count / Math.max(group.credential.total_request_count, 1)) * 100) }} 成功率
+                      </div>
+                    </div>
+                  </template>
+                  <div class="credential-group__body">
+                    <token-usage-strip :usage="group.credential.token_usage" compact />
+                    <div class="credential-group__models">
+                      <breakdown-list
+                        :items="group.models"
+                        :total-requests="group.credential.total_request_count"
+                        empty-text="这个 credential 下还没有 model 子分组数据"
+                      />
+                    </div>
+                  </div>
+                </n-collapse-item>
+              </n-collapse>
+            </template>
+            <n-empty v-else description="还没有凭证请求数据" />
+          </n-card>
+        </n-grid-item>
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false" title="最忙 API Key">
+            <breakdown-list
+              :items="topApiKeys"
+              :total-requests="usage.summary.total_request_count"
+              empty-text="还没有 API key 请求数据"
+            />
+          </n-card>
+        </n-grid-item>
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false" title="最热模型">
+            <breakdown-list
+              :items="topModels"
+              :total-requests="usage.summary.total_request_count"
+              empty-text="还没有模型统计"
+            />
+          </n-card>
+        </n-grid-item>
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false" title="最忙路径">
+            <breakdown-list
+              :items="busiestPaths"
+              :total-requests="usage.summary.total_request_count"
+              empty-text="还没有路径统计"
+            />
+          </n-card>
+        </n-grid-item>
+      </n-grid>
+
+      <n-grid cols="1 xl:2" responsive="screen" :x-gap="18" :y-gap="18">
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false" title="状态码分布">
+            <breakdown-list
+              :items="statusCodes"
+              :total-requests="usage.summary.total_request_count"
+              empty-text="没有状态码分布数据"
+            />
+          </n-card>
+        </n-grid-item>
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false" title="失败阶段分布">
+            <breakdown-list
+              :items="errorPhases"
+              :total-requests="usage.summary.failure_request_count"
+              empty-text="还没有失败阶段统计"
+            />
           </n-card>
         </n-grid-item>
       </n-grid>
@@ -227,7 +414,7 @@ onMounted(() => {
           <div class="section-headline">
             <div>
               <div class="section-title">最近失败请求</div>
-              <div class="section-note">快速定位 credential、API key、路径和失败阶段</div>
+              <div class="section-note">直接定位 credential、API key、路径、状态码和失败阶段</div>
             </div>
           </div>
         </template>
@@ -302,7 +489,7 @@ onMounted(() => {
 
 .page-subtitle {
   margin: 0;
-  max-width: 60rem;
+  max-width: 66rem;
   color: var(--cp-text-soft);
   font-size: 15px;
   line-height: 1.75;
@@ -341,45 +528,39 @@ onMounted(() => {
   font-size: 13px;
 }
 
-.rank-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(180px, 220px);
-  gap: 14px;
-  padding: 12px 0;
-  border-top: 1px solid var(--cp-border);
-}
-
-.rank-row:first-child {
-  border-top: 0;
-  padding-top: 0;
-}
-
-.rank-row__title {
-  font-size: 16px;
-  font-weight: 700;
-}
-
-.rank-row__meta {
-  margin-top: 6px;
-  color: var(--cp-text-soft);
-  font-size: 13px;
-  line-height: 1.6;
-}
-
-.rank-row__stats {
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 8px;
-  text-align: right;
-  font-size: 13px;
-  color: var(--cp-text-soft);
-}
-
 .error-stack {
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+
+.credential-group__header {
+  min-width: 0;
+}
+
+.credential-group__title {
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.credential-group__meta {
+  margin-top: 6px;
+  color: var(--cp-text-soft);
+  font-size: 12px;
+  line-height: 1.75;
+  word-break: break-word;
+}
+
+.credential-group__body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-top: 8px;
+}
+
+.credential-group__models {
+  padding-top: 2px;
 }
 
 .error-item {
@@ -426,14 +607,6 @@ onMounted(() => {
 
   .skeleton-grid {
     grid-template-columns: 1fr;
-  }
-
-  .rank-row {
-    grid-template-columns: 1fr;
-  }
-
-  .rank-row__stats {
-    text-align: left;
   }
 }
 </style>

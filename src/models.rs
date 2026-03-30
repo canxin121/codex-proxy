@@ -152,6 +152,17 @@ pub struct ListRequestRecordsQuery {
     pub only_failures: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct UsageStatsQuery {
+    #[serde(rename = "credential_id")]
+    pub credential_id: Option<String>,
+    #[serde(rename = "api_key_id")]
+    pub api_key_id: Option<String>,
+    #[serde(rename = "only_failures")]
+    pub only_failures: Option<bool>,
+    pub top: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CredentialView {
     #[serde(rename = "credential_id")]
@@ -300,6 +311,87 @@ pub struct RequestStatsSummaryView {
     pub last_failure_at: Option<DateTime<Utc>>,
     #[serde(rename = "token_usage")]
     pub usage: RequestUsageTotalsView,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct RequestDurationStatsView {
+    #[serde(rename = "average_duration_ms")]
+    pub average_duration_ms: Option<f64>,
+    #[serde(rename = "max_duration_ms")]
+    pub max_duration_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct UsageTimeBucketView {
+    pub bucket: String,
+    #[serde(rename = "total_request_count")]
+    pub total_request_count: i64,
+    #[serde(rename = "success_request_count")]
+    pub success_request_count: i64,
+    #[serde(rename = "failure_request_count")]
+    pub failure_request_count: i64,
+    #[serde(rename = "token_usage")]
+    pub usage: RequestUsageTotalsView,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct RequestBreakdownView {
+    pub key: String,
+    pub label: String,
+    #[serde(rename = "total_request_count")]
+    pub total_request_count: i64,
+    #[serde(rename = "success_request_count")]
+    pub success_request_count: i64,
+    #[serde(rename = "failure_request_count")]
+    pub failure_request_count: i64,
+    #[serde(rename = "last_request_at")]
+    pub last_request_at: Option<DateTime<Utc>>,
+    #[serde(rename = "average_duration_ms")]
+    pub average_duration_ms: Option<f64>,
+    #[serde(rename = "max_duration_ms")]
+    pub max_duration_ms: Option<i64>,
+    #[serde(rename = "token_usage")]
+    pub usage: RequestUsageTotalsView,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct CredentialModelBreakdownView {
+    pub credential: RequestBreakdownView,
+    pub models: Vec<RequestBreakdownView>,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct UsageStatsFiltersView {
+    #[serde(rename = "credential_id")]
+    pub credential_id: Option<String>,
+    #[serde(rename = "api_key_id")]
+    pub api_key_id: Option<String>,
+    #[serde(rename = "only_failures")]
+    pub only_failures: bool,
+    pub top: u64,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct UsageStatsView {
+    #[serde(rename = "generated_at")]
+    pub generated_at: DateTime<Utc>,
+    pub filters: UsageStatsFiltersView,
+    pub summary: RequestStatsSummaryView,
+    pub duration: RequestDurationStatsView,
+    pub hourly: Vec<UsageTimeBucketView>,
+    pub daily: Vec<UsageTimeBucketView>,
+    pub credentials: Vec<RequestBreakdownView>,
+    #[serde(rename = "credential_model_groups")]
+    pub credential_model_groups: Vec<CredentialModelBreakdownView>,
+    #[serde(rename = "api_keys")]
+    pub api_keys: Vec<RequestBreakdownView>,
+    pub models: Vec<RequestBreakdownView>,
+    pub paths: Vec<RequestBreakdownView>,
+    pub transports: Vec<RequestBreakdownView>,
+    #[serde(rename = "status_codes")]
+    pub status_codes: Vec<RequestBreakdownView>,
+    #[serde(rename = "error_phases")]
+    pub error_phases: Vec<RequestBreakdownView>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -475,6 +567,42 @@ pub struct RequestStatsAggregateRow {
     pub total_tokens: Option<i64>,
 }
 
+#[derive(Debug, Clone, Default, FromQueryResult)]
+pub struct RequestDurationAggregateRow {
+    pub average_duration_ms: Option<f64>,
+    pub max_duration_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, FromQueryResult)]
+pub struct UsageTimeBucketRow {
+    pub bucket: Option<String>,
+    pub total_request_count: Option<i64>,
+    pub success_request_count: Option<i64>,
+    pub failure_request_count: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub reasoning_output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, FromQueryResult)]
+pub struct RequestBreakdownRow {
+    pub group_key: Option<String>,
+    pub group_label: Option<String>,
+    pub total_request_count: Option<i64>,
+    pub success_request_count: Option<i64>,
+    pub failure_request_count: Option<i64>,
+    pub last_request_at: Option<DateTime<Utc>>,
+    pub average_duration_ms: Option<f64>,
+    pub max_duration_ms: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub reasoning_output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+}
+
 impl CredentialLimitView {
     pub fn from_model(model: credential_limit::Model) -> Self {
         Self {
@@ -552,6 +680,68 @@ impl RequestStatsSummaryView {
             last_request_at: row.last_request_at,
             last_success_at: row.last_success_at,
             last_failure_at: row.last_failure_at,
+            usage: RequestUsageTotalsView::from_numbers(
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                reasoning_output_tokens,
+                total_tokens,
+            ),
+        }
+    }
+}
+
+impl RequestDurationStatsView {
+    pub fn from_aggregate(row: RequestDurationAggregateRow) -> Self {
+        Self {
+            average_duration_ms: row.average_duration_ms,
+            max_duration_ms: row.max_duration_ms,
+        }
+    }
+}
+
+impl UsageTimeBucketView {
+    pub fn from_row(row: UsageTimeBucketRow) -> Self {
+        let bucket = row.bucket.unwrap_or_else(|| "unknown".to_string());
+        let input_tokens = row.input_tokens.unwrap_or(0);
+        let cached_input_tokens = row.cached_input_tokens.unwrap_or(0);
+        let output_tokens = row.output_tokens.unwrap_or(0);
+        let reasoning_output_tokens = row.reasoning_output_tokens.unwrap_or(0);
+        let total_tokens = row.total_tokens.unwrap_or(0);
+
+        Self {
+            bucket,
+            total_request_count: row.total_request_count.unwrap_or(0),
+            success_request_count: row.success_request_count.unwrap_or(0),
+            failure_request_count: row.failure_request_count.unwrap_or(0),
+            usage: RequestUsageTotalsView::from_numbers(
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                reasoning_output_tokens,
+                total_tokens,
+            ),
+        }
+    }
+}
+
+impl RequestBreakdownView {
+    pub fn from_row(row: RequestBreakdownRow) -> Self {
+        let input_tokens = row.input_tokens.unwrap_or(0);
+        let cached_input_tokens = row.cached_input_tokens.unwrap_or(0);
+        let output_tokens = row.output_tokens.unwrap_or(0);
+        let reasoning_output_tokens = row.reasoning_output_tokens.unwrap_or(0);
+        let total_tokens = row.total_tokens.unwrap_or(0);
+
+        Self {
+            key: row.group_key.unwrap_or_else(|| "unknown".to_string()),
+            label: row.group_label.unwrap_or_else(|| "unknown".to_string()),
+            total_request_count: row.total_request_count.unwrap_or(0),
+            success_request_count: row.success_request_count.unwrap_or(0),
+            failure_request_count: row.failure_request_count.unwrap_or(0),
+            last_request_at: row.last_request_at,
+            average_duration_ms: row.average_duration_ms,
+            max_duration_ms: row.max_duration_ms,
             usage: RequestUsageTotalsView::from_numbers(
                 input_tokens,
                 cached_input_tokens,

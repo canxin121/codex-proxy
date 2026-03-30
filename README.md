@@ -82,6 +82,10 @@ Then run `codex-proxy`; opening the root URL will show the admin console.
   - each credential
   - each API key
   - overall proxy traffic
+- Exposes richer usage analytics for the admin UI, including:
+  - day/hour traffic trends
+  - token trends
+  - credential, API key, model, path, status-code, and error-phase breakdowns
 - Proxies:
   - HTTP `POST /responses`
   - HTTP `POST /responses/compact`
@@ -133,6 +137,7 @@ If `CODEX_PROXY_ADMIN_TOKEN` is not set, the service generates one at startup an
 - `PATCH /admin/api-keys/:id`
 - `DELETE /admin/api-keys/:id`
 - `GET /admin/stats/overview`
+- `GET /admin/stats/usage`
 - `GET /admin/stats/requests`
 
 Admin routes require:
@@ -154,6 +159,13 @@ The overview route returns global counters plus recent failures, and the request
 - `credential_id`
 - `api_key_id`
 - `only_failures`
+
+The usage analytics route supports:
+
+- `credential_id`
+- `api_key_id`
+- `only_failures`
+- `top`
 
 ## Credential payload
 

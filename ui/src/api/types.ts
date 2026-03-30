@@ -42,6 +42,60 @@ export interface RequestStatsSummaryView {
   token_usage: RequestUsageTotalsView
 }
 
+export interface RequestDurationStatsView {
+  average_duration_ms: number | null
+  max_duration_ms: number | null
+}
+
+export interface UsageTimeBucketView {
+  bucket: string
+  total_request_count: number
+  success_request_count: number
+  failure_request_count: number
+  token_usage: RequestUsageTotalsView
+}
+
+export interface RequestBreakdownView {
+  key: string
+  label: string
+  total_request_count: number
+  success_request_count: number
+  failure_request_count: number
+  last_request_at: string | null
+  average_duration_ms: number | null
+  max_duration_ms: number | null
+  token_usage: RequestUsageTotalsView
+}
+
+export interface CredentialModelBreakdownView {
+  credential: RequestBreakdownView
+  models: RequestBreakdownView[]
+}
+
+export interface UsageStatsFiltersView {
+  credential_id: string | null
+  api_key_id: string | null
+  only_failures: boolean
+  top: number
+}
+
+export interface UsageStatsView {
+  generated_at: string
+  filters: UsageStatsFiltersView
+  summary: RequestStatsSummaryView
+  duration: RequestDurationStatsView
+  hourly: UsageTimeBucketView[]
+  daily: UsageTimeBucketView[]
+  credentials: RequestBreakdownView[]
+  credential_model_groups: CredentialModelBreakdownView[]
+  api_keys: RequestBreakdownView[]
+  models: RequestBreakdownView[]
+  paths: RequestBreakdownView[]
+  transports: RequestBreakdownView[]
+  status_codes: RequestBreakdownView[]
+  error_phases: RequestBreakdownView[]
+}
+
 export interface LastRequestErrorView {
   request_id: string
   credential_id: string
@@ -208,4 +262,11 @@ export interface RequestQuery {
   credential_id?: string
   api_key_id?: string
   only_failures?: boolean
+}
+
+export interface UsageQuery {
+  credential_id?: string
+  api_key_id?: string
+  only_failures?: boolean
+  top?: number
 }

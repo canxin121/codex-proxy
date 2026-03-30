@@ -17,6 +17,8 @@ import type {
   StatsOverviewView,
   UpdateApiKeyPayload,
   UpdateCredentialPayload,
+  UsageQuery,
+  UsageStatsView,
 } from '@/api/types'
 
 export const api = {
@@ -107,6 +109,14 @@ export const api = {
   },
   getStatsOverview(context: ApiContext) {
     return apiRequest<StatsOverviewView>(context, '/admin/stats/overview')
+  },
+  getUsageStats(context: ApiContext, query: UsageQuery = {}) {
+    return apiRequest<UsageStatsView>(
+      context,
+      '/admin/stats/usage',
+      {},
+      query as Record<string, string | number | boolean | undefined>,
+    )
   },
   listRequestRecords(context: ApiContext, query: RequestQuery) {
     return apiRequest<RequestRecordView[]>(

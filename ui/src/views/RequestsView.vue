@@ -6,6 +6,8 @@ import {
   NDrawer,
   NDrawerContent,
   NEmpty,
+  NGrid,
+  NGridItem,
   NIcon,
   NInputNumber,
   NSelect,
@@ -15,13 +17,19 @@ import {
   NTag,
 } from 'naive-ui'
 import { EyeOutline, RefreshOutline } from '@vicons/ionicons5'
+import BreakdownList from '@/components/BreakdownList.vue'
 import MetricCard from '@/components/MetricCard.vue'
 import TokenUsageStrip from '@/components/TokenUsageStrip.vue'
+import TrendAreaChart from '@/components/TrendAreaChart.vue'
 import { api } from '@/api/service'
-import type { ApiKeyView, CredentialView, RequestRecordView } from '@/api/types'
+import type { ApiKeyView, CredentialView, RequestBreakdownView, RequestRecordView, UsageStatsView } from '@/api/types'
 import { useSessionStore } from '@/stores/session'
 import { useAutoRefresh } from '@/composables/use-auto-refresh'
-import { formatDateTime, formatDurationMs, formatNumber } from '@/utils/format'
+import { formatDateTime, formatDurationMs, formatNumber, formatPercent } from '@/utils/format'
+
+type BreakdownListItem = RequestBreakdownView & {
+  description?: string
+}
 
 const session = useSessionStore()
 
@@ -30,11 +38,13 @@ const errorMessage = ref('')
 const records = ref<RequestRecordView[]>([])
 const credentials = ref<CredentialView[]>([])
 const apiKeys = ref<ApiKeyView[]>([])
+const usage = ref<UsageStatsView | null>(null)
 const credentialFilter = ref<string | null>(null)
 const apiKeyFilter = ref<string | null>(null)
 const onlyFailures = ref(false)
 const limit = ref(100)
 const selectedRecord = ref<RequestRecordView | null>(null)
+
 const showDetailDrawer = computed({
   get: () => Boolean(selectedRecord.value),
   set: (value: boolean) => {
@@ -58,12 +68,73 @@ const apiKeyOptions = computed(() =>
   })),
 )
 
-const visibleSummary = computed(() => ({
-  total: records.value.length,
-  success: records.value.filter((item) => item.request_success === true).length,
-  failure: records.value.filter((item) => item.request_success === false).length,
-  totalTokens: records.value.reduce((sum, item) => sum + item.token_usage.all_tokens, 0),
-}))
+const filterSummary = computed(() => usage.value?.summary ?? null)
+
+const failureRate = computed(() => {
+  const current = filterSummary.value
+  if (!current || current.total_request_count === 0) {
+    return '0%'
+  }
+  return formatPercent((current.failure_request_count / current.total_request_count) * 100)
+})
+
+const averageDuration = computed(() => {
+  const value = usage.value?.duration.average_duration_ms
+  if (value === null || value === undefined) {
+    return '未记录'
+  }
+  return formatDurationMs(Math.round(value))
+})
+
+const maxDuration = computed(() => {
+  const value = usage.value?.duration.max_duration_ms
+  if (value === null || value === undefined) {
+    return '未记录'
+  }
+  return formatDurationMs(value)
+})
+
+const dailyRequestSeries = computed(() =>
+  (usage.value?.daily ?? []).slice(-14).map((item) => ({
+    label: item.bucket.slice(5),
+    value: item.total_request_count,
+  })),
+)
+
+const dailyTokenSeries = computed(() =>
+  (usage.value?.daily ?? []).slice(-14).map((item) => ({
+    label: item.bucket.slice(5),
+    value: item.token_usage.all_tokens,
+  })),
+)
+
+const topModels = computed<BreakdownListItem[]>(() =>
+  (usage.value?.models ?? []).slice(0, 6).map((item) => ({
+    ...item,
+    description: `输入 ${formatNumber(item.token_usage.read_input_tokens)} · 输出 ${formatNumber(item.token_usage.write_output_tokens)}`,
+  })),
+)
+
+const topPaths = computed<BreakdownListItem[]>(() =>
+  (usage.value?.paths ?? []).slice(0, 6).map((item) => ({
+    ...item,
+    description: `总 tokens ${formatNumber(item.token_usage.all_tokens)} · 失败 ${formatNumber(item.failure_request_count)}`,
+  })),
+)
+
+const statusCodes = computed<BreakdownListItem[]>(() =>
+  (usage.value?.status_codes ?? []).slice(0, 6).map((item) => ({
+    ...item,
+    description: item.label === 'unknown' ? '没有上游状态码' : '按状态码聚合',
+  })),
+)
+
+const errorPhases = computed<BreakdownListItem[]>(() =>
+  (usage.value?.error_phases ?? []).slice(0, 6).map((item) => ({
+    ...item,
+    description: item.label === 'unknown' ? '没有错误阶段' : '失败请求阶段',
+  })),
+)
 
 async function load() {
   if (!session.hasAdminSession) {
@@ -72,17 +143,26 @@ async function load() {
   loading.value = true
   errorMessage.value = ''
   try {
-    const [recordResponse, credentialResponse, apiKeyResponse] = await Promise.all([
+    const query = {
+      credential_id: credentialFilter.value ?? undefined,
+      api_key_id: apiKeyFilter.value ?? undefined,
+      only_failures: onlyFailures.value,
+    }
+
+    const [recordResponse, usageResponse, credentialResponse, apiKeyResponse] = await Promise.all([
       api.listRequestRecords(session.apiContext, {
+        ...query,
         limit: limit.value,
-        credential_id: credentialFilter.value ?? undefined,
-        api_key_id: apiKeyFilter.value ?? undefined,
-        only_failures: onlyFailures.value,
+      }),
+      api.getUsageStats(session.apiContext, {
+        ...query,
+        top: 8,
       }),
       api.listCredentials(session.apiContext),
       api.listApiKeys(session.apiContext),
     ])
     records.value = recordResponse
+    usage.value = usageResponse
     credentials.value = credentialResponse
     apiKeys.value = apiKeyResponse
   } catch (error) {
@@ -108,9 +188,9 @@ onMounted(() => {
     <div class="page-head">
       <div>
         <div class="page-kicker">Request Journal</div>
-        <h1 class="page-title display-font">逐请求记录、错误快照与 token 细账</h1>
+        <h1 class="page-title display-font">当前筛选范围的统计剖面 + 逐请求明细</h1>
         <p class="page-subtitle">
-          每一条代理请求都会在这里留下完整记录，包括 credential、API key、transport、状态、错误阶段、耗时以及缓存 / 推理 / 输出 token。
+          这里不再只是表格。每次筛选都会同步刷新聚合统计，让你直接看出当前范围里哪个模型、哪个路径、哪个状态码或错误阶段最突出。
         </p>
       </div>
       <n-button secondary type="primary" :loading="loading" @click="load">
@@ -122,21 +202,6 @@ onMounted(() => {
     </div>
 
     <p v-if="errorMessage" class="page-error">{{ errorMessage }}</p>
-
-    <n-grid cols="1 s:2 xl:4" responsive="screen" :x-gap="18" :y-gap="18">
-      <n-grid-item>
-        <metric-card title="已加载记录" :value="formatNumber(visibleSummary.total)" note="当前筛选条件下的请求条数" />
-      </n-grid-item>
-      <n-grid-item>
-        <metric-card title="成功" :value="formatNumber(visibleSummary.success)" note="request_success = true" tone="success" />
-      </n-grid-item>
-      <n-grid-item>
-        <metric-card title="失败" :value="formatNumber(visibleSummary.failure)" note="request_success = false" tone="danger" />
-      </n-grid-item>
-      <n-grid-item>
-        <metric-card title="Token 合计" :value="formatNumber(visibleSummary.totalTokens)" note="已加载记录的 total_tokens 求和" tone="accent" />
-      </n-grid-item>
-    </n-grid>
 
     <n-card class="app-shell-card" :bordered="false">
       <n-space justify="space-between" wrap>
@@ -165,7 +230,126 @@ onMounted(() => {
       </n-space>
     </n-card>
 
-    <n-card class="app-shell-card" :bordered="false" title="请求记录">
+    <template v-if="usage">
+      <n-grid cols="1 s:2 xl:4" responsive="screen" :x-gap="18" :y-gap="18">
+        <n-grid-item>
+          <metric-card
+            title="筛选范围请求数"
+            :value="formatNumber(usage.summary.total_request_count)"
+            :note="`当前列表已加载 ${formatNumber(records.length)} 条，limit = ${formatNumber(limit)}`"
+            tone="accent"
+          />
+        </n-grid-item>
+        <n-grid-item>
+          <metric-card
+            title="成功"
+            :value="formatNumber(usage.summary.success_request_count)"
+            :note="`${formatNumber(usage.summary.http_request_count)} HTTP · ${formatNumber(usage.summary.websocket_request_count)} WS`"
+            tone="success"
+          />
+        </n-grid-item>
+        <n-grid-item>
+          <metric-card
+            title="失败"
+            :value="formatNumber(usage.summary.failure_request_count)"
+            :note="`失败占比 ${failureRate}`"
+            tone="danger"
+          />
+        </n-grid-item>
+        <n-grid-item>
+          <metric-card
+            title="平均耗时"
+            :value="averageDuration"
+            :note="`最大耗时 ${maxDuration}`"
+          />
+        </n-grid-item>
+      </n-grid>
+
+      <n-card class="section-card app-shell-card" :bordered="false">
+        <template #header>
+          <div class="section-headline">
+            <div>
+              <div class="section-title">当前筛选范围的 Token 结构</div>
+              <div class="section-note">
+                统计生成于 {{ formatDateTime(usage.generated_at) }}
+              </div>
+            </div>
+            <n-tag round type="info">
+              总量 {{ formatNumber(usage.summary.token_usage.all_tokens) }}
+            </n-tag>
+          </div>
+        </template>
+        <token-usage-strip :usage="usage.summary.token_usage" />
+      </n-card>
+
+      <n-grid cols="1 xl:2" responsive="screen" :x-gap="18" :y-gap="18">
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false" title="按天请求趋势">
+            <trend-area-chart :items="dailyRequestSeries" />
+          </n-card>
+        </n-grid-item>
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false" title="按天 Token 趋势">
+            <trend-area-chart :items="dailyTokenSeries" compact stroke="#b4493f" />
+          </n-card>
+        </n-grid-item>
+      </n-grid>
+
+      <n-grid cols="1 xl:2" responsive="screen" :x-gap="18" :y-gap="18">
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false" title="最热模型">
+            <breakdown-list
+              :items="topModels"
+              :total-requests="usage.summary.total_request_count"
+              empty-text="当前筛选范围没有模型数据"
+            />
+          </n-card>
+        </n-grid-item>
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false" title="最忙路径">
+            <breakdown-list
+              :items="topPaths"
+              :total-requests="usage.summary.total_request_count"
+              empty-text="当前筛选范围没有路径数据"
+            />
+          </n-card>
+        </n-grid-item>
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false" title="状态码分布">
+            <breakdown-list
+              :items="statusCodes"
+              :total-requests="usage.summary.total_request_count"
+              empty-text="当前筛选范围没有状态码数据"
+            />
+          </n-card>
+        </n-grid-item>
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false" title="失败阶段分布">
+            <breakdown-list
+              :items="errorPhases"
+              :total-requests="usage.summary.failure_request_count"
+              empty-text="当前筛选范围没有失败阶段数据"
+            />
+          </n-card>
+        </n-grid-item>
+      </n-grid>
+    </template>
+
+    <n-card class="app-shell-card" :bordered="false">
+      <template #header>
+        <div class="section-headline">
+          <div>
+            <div class="section-title">请求记录</div>
+            <div class="section-note">
+              {{ usage ? `当前筛选范围共 ${formatNumber(usage.summary.total_request_count)} 条，表格已加载 ${formatNumber(records.length)} 条` : '明细记录' }}
+            </div>
+          </div>
+          <n-tag round type="default">
+            limit {{ formatNumber(limit) }}
+          </n-tag>
+        </div>
+      </template>
+
       <template v-if="records.length">
         <n-table striped :single-line="false">
           <thead>
@@ -313,7 +497,7 @@ onMounted(() => {
 
 .page-subtitle {
   margin: 0;
-  max-width: 64rem;
+  max-width: 66rem;
   color: var(--cp-text-soft);
   line-height: 1.75;
 }
@@ -323,6 +507,19 @@ onMounted(() => {
   color: var(--cp-danger);
 }
 
+.section-headline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.section-title {
+  font-size: 18px;
+  font-weight: 800;
+}
+
+.section-note,
 .filter-label,
 .cell-meta {
   color: var(--cp-text-soft);
@@ -353,7 +550,8 @@ onMounted(() => {
 }
 
 @media (max-width: 1023px) {
-  .page-head {
+  .page-head,
+  .section-headline {
     flex-direction: column;
   }
 

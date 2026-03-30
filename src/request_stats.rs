@@ -4,12 +4,22 @@ use crate::entities::credential;
 use crate::entities::request_record;
 use crate::error::AppError;
 use crate::models::AuthStatus;
+use crate::models::CredentialModelBreakdownView;
 use crate::models::LastRequestErrorView;
 use crate::models::ListRequestRecordsQuery;
+use crate::models::RequestBreakdownRow;
+use crate::models::RequestBreakdownView;
+use crate::models::RequestDurationAggregateRow;
+use crate::models::RequestDurationStatsView;
 use crate::models::RequestRecordView;
 use crate::models::RequestStatsAggregateRow;
 use crate::models::RequestStatsSummaryView;
 use crate::models::StatsOverviewView;
+use crate::models::UsageStatsFiltersView;
+use crate::models::UsageStatsQuery;
+use crate::models::UsageStatsView;
+use crate::models::UsageTimeBucketRow;
+use crate::models::UsageTimeBucketView;
 use crate::state::AppState;
 use crate::state::AuthenticatedPrincipal;
 use axum::http::StatusCode;
@@ -34,6 +44,75 @@ use uuid::Uuid;
 
 const DEFAULT_REQUEST_RECORD_LIMIT: u64 = 100;
 const MAX_REQUEST_RECORD_LIMIT: u64 = 1_000;
+const DEFAULT_USAGE_BREAKDOWN_LIMIT: u64 = 8;
+const MAX_USAGE_BREAKDOWN_LIMIT: u64 = 20;
+
+#[derive(Copy, Clone)]
+enum TimeBucket {
+    Hour,
+    Day,
+}
+
+impl TimeBucket {
+    fn expression(self) -> &'static str {
+        match self {
+            Self::Hour => "substr(request_started_at, 12, 2)",
+            Self::Day => "substr(request_started_at, 1, 10)",
+        }
+    }
+
+    fn normalize_label(self, value: Option<String>) -> String {
+        let value = value.unwrap_or_else(|| "unknown".to_string());
+        match self {
+            Self::Hour => format!("{value}:00"),
+            Self::Day => value,
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+enum BreakdownDimension {
+    Credential,
+    ApiKey,
+    Model,
+    Path,
+    Transport,
+    StatusCode,
+    ErrorPhase,
+}
+
+impl BreakdownDimension {
+    fn expressions(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Credential => ("credential_id", "credential_name"),
+            Self::ApiKey => (
+                "COALESCE(api_key_id, 'system')",
+                "COALESCE(api_key_name, 'system/admin')",
+            ),
+            Self::Model => (
+                "COALESCE(requested_model, 'unknown')",
+                "COALESCE(requested_model, 'unknown')",
+            ),
+            Self::Path => (
+                "request_method || ' ' || request_path",
+                "request_method || ' ' || request_path",
+            ),
+            Self::Transport => ("transport", "transport"),
+            Self::StatusCode => (
+                "COALESCE(CAST(upstream_status_code AS TEXT), 'unknown')",
+                "COALESCE(CAST(upstream_status_code AS TEXT), 'unknown')",
+            ),
+            Self::ErrorPhase => (
+                "COALESCE(error_phase, 'unknown')",
+                "COALESCE(error_phase, 'unknown')",
+            ),
+        }
+    }
+
+    fn forces_failure_scope(self) -> bool {
+        matches!(self, Self::ErrorPhase)
+    }
+}
 
 #[derive(Clone)]
 pub struct RequestRecordStart {
@@ -391,21 +470,147 @@ pub async fn start_request_record(
 }
 
 pub async fn request_stats_overall(state: &AppState) -> Result<RequestStatsSummaryView, AppError> {
-    request_stats_with_scope(state, None, None).await
+    request_stats_with_scope(state, None, None, false).await
 }
 
 pub async fn request_stats_for_credential(
     state: &AppState,
     credential_id: &str,
 ) -> Result<RequestStatsSummaryView, AppError> {
-    request_stats_with_scope(state, Some(credential_id), None).await
+    request_stats_with_scope(state, Some(credential_id), None, false).await
 }
 
 pub async fn request_stats_for_api_key(
     state: &AppState,
     api_key_id: &str,
 ) -> Result<RequestStatsSummaryView, AppError> {
-    request_stats_with_scope(state, None, Some(api_key_id)).await
+    request_stats_with_scope(state, None, Some(api_key_id), false).await
+}
+
+pub async fn usage_stats(
+    state: &AppState,
+    query: &UsageStatsQuery,
+) -> Result<UsageStatsView, AppError> {
+    let top = query
+        .top
+        .unwrap_or(DEFAULT_USAGE_BREAKDOWN_LIMIT)
+        .clamp(1, MAX_USAGE_BREAKDOWN_LIMIT);
+    let only_failures = query.only_failures.unwrap_or(false);
+    let credential_id = query.credential_id.as_deref();
+    let api_key_id = query.api_key_id.as_deref();
+
+    let (
+        summary,
+        duration,
+        hourly,
+        daily,
+        credentials,
+        api_keys,
+        models,
+        paths,
+        transports,
+        status_codes,
+        error_phases,
+    ) = tokio::try_join!(
+        request_stats_with_scope(state, credential_id, api_key_id, only_failures),
+        duration_stats_with_scope(state, credential_id, api_key_id, only_failures),
+        usage_time_buckets_with_scope(
+            state,
+            credential_id,
+            api_key_id,
+            only_failures,
+            TimeBucket::Hour
+        ),
+        usage_time_buckets_with_scope(
+            state,
+            credential_id,
+            api_key_id,
+            only_failures,
+            TimeBucket::Day
+        ),
+        request_breakdown_with_scope(
+            state,
+            credential_id,
+            api_key_id,
+            only_failures,
+            BreakdownDimension::Credential,
+            top,
+        ),
+        request_breakdown_with_scope(
+            state,
+            credential_id,
+            api_key_id,
+            only_failures,
+            BreakdownDimension::ApiKey,
+            top,
+        ),
+        request_breakdown_with_scope(
+            state,
+            credential_id,
+            api_key_id,
+            only_failures,
+            BreakdownDimension::Model,
+            top,
+        ),
+        request_breakdown_with_scope(
+            state,
+            credential_id,
+            api_key_id,
+            only_failures,
+            BreakdownDimension::Path,
+            top,
+        ),
+        request_breakdown_with_scope(
+            state,
+            credential_id,
+            api_key_id,
+            only_failures,
+            BreakdownDimension::Transport,
+            top,
+        ),
+        request_breakdown_with_scope(
+            state,
+            credential_id,
+            api_key_id,
+            only_failures,
+            BreakdownDimension::StatusCode,
+            top,
+        ),
+        request_breakdown_with_scope(
+            state,
+            credential_id,
+            api_key_id,
+            only_failures,
+            BreakdownDimension::ErrorPhase,
+            top,
+        ),
+    )?;
+
+    let credential_model_groups =
+        credential_model_groups_with_scope(state, &credentials, api_key_id, only_failures, top)
+            .await?;
+
+    Ok(UsageStatsView {
+        generated_at: Utc::now(),
+        filters: UsageStatsFiltersView {
+            credential_id: query.credential_id.clone(),
+            api_key_id: query.api_key_id.clone(),
+            only_failures,
+            top,
+        },
+        summary,
+        duration,
+        hourly,
+        daily,
+        credentials,
+        credential_model_groups,
+        api_keys,
+        models,
+        paths,
+        transports,
+        status_codes,
+        error_phases,
+    })
 }
 
 pub async fn last_request_error_for_credential(
@@ -600,8 +805,9 @@ async fn request_stats_with_scope(
     state: &AppState,
     credential_id: Option<&str>,
     api_key_id: Option<&str>,
+    only_failures: bool,
 ) -> Result<RequestStatsSummaryView, AppError> {
-    let (where_clause, values) = build_where_clause(credential_id, api_key_id);
+    let (where_clause, values) = build_where_clause(credential_id, api_key_id, only_failures);
     let sql = format!(
         r#"
         SELECT
@@ -635,6 +841,163 @@ async fn request_stats_with_scope(
     .unwrap_or_default();
 
     Ok(RequestStatsSummaryView::from_aggregate(row))
+}
+
+async fn duration_stats_with_scope(
+    state: &AppState,
+    credential_id: Option<&str>,
+    api_key_id: Option<&str>,
+    only_failures: bool,
+) -> Result<RequestDurationStatsView, AppError> {
+    let (where_clause, values) = build_where_clause(credential_id, api_key_id, only_failures);
+    let sql = format!(
+        r#"
+        SELECT
+            AVG(duration_ms) AS average_duration_ms,
+            MAX(duration_ms) AS max_duration_ms
+        FROM request_records
+        {where_clause}
+        "#
+    );
+
+    let row = RequestDurationAggregateRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        sql,
+        values,
+    ))
+    .one(state.db())
+    .await
+    .map_err(|err| AppError::internal(err.to_string()))?
+    .unwrap_or_default();
+
+    Ok(RequestDurationStatsView::from_aggregate(row))
+}
+
+async fn usage_time_buckets_with_scope(
+    state: &AppState,
+    credential_id: Option<&str>,
+    api_key_id: Option<&str>,
+    only_failures: bool,
+    bucket: TimeBucket,
+) -> Result<Vec<UsageTimeBucketView>, AppError> {
+    let (where_clause, values) = build_where_clause(credential_id, api_key_id, only_failures);
+    let bucket_expr = bucket.expression();
+    let sql = format!(
+        r#"
+        SELECT
+            {bucket_expr} AS bucket,
+            COUNT(*) AS total_request_count,
+            SUM(CASE WHEN request_success = 1 THEN 1 ELSE 0 END) AS success_request_count,
+            SUM(CASE WHEN request_success = 0 THEN 1 ELSE 0 END) AS failure_request_count,
+            SUM(input_tokens) AS input_tokens,
+            SUM(cached_input_tokens) AS cached_input_tokens,
+            SUM(output_tokens) AS output_tokens,
+            SUM(reasoning_output_tokens) AS reasoning_output_tokens,
+            SUM(total_tokens) AS total_tokens
+        FROM request_records
+        {where_clause}
+        GROUP BY {bucket_expr}
+        ORDER BY {bucket_expr} ASC
+        "#
+    );
+
+    let rows = UsageTimeBucketRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        sql,
+        values,
+    ))
+    .all(state.db())
+    .await
+    .map_err(|err| AppError::internal(err.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|mut row| {
+            row.bucket = Some(bucket.normalize_label(row.bucket));
+            UsageTimeBucketView::from_row(row)
+        })
+        .collect())
+}
+
+async fn request_breakdown_with_scope(
+    state: &AppState,
+    credential_id: Option<&str>,
+    api_key_id: Option<&str>,
+    only_failures: bool,
+    dimension: BreakdownDimension,
+    limit: u64,
+) -> Result<Vec<RequestBreakdownView>, AppError> {
+    let (group_key_expr, group_label_expr) = dimension.expressions();
+    let force_failures = only_failures || dimension.forces_failure_scope();
+    let (where_clause, mut values) = build_where_clause(credential_id, api_key_id, force_failures);
+    values.push((limit as i64).into());
+
+    let sql = format!(
+        r#"
+        SELECT
+            {group_key_expr} AS group_key,
+            {group_label_expr} AS group_label,
+            COUNT(*) AS total_request_count,
+            SUM(CASE WHEN request_success = 1 THEN 1 ELSE 0 END) AS success_request_count,
+            SUM(CASE WHEN request_success = 0 THEN 1 ELSE 0 END) AS failure_request_count,
+            MAX(request_started_at) AS last_request_at,
+            AVG(duration_ms) AS average_duration_ms,
+            MAX(duration_ms) AS max_duration_ms,
+            SUM(input_tokens) AS input_tokens,
+            SUM(cached_input_tokens) AS cached_input_tokens,
+            SUM(output_tokens) AS output_tokens,
+            SUM(reasoning_output_tokens) AS reasoning_output_tokens,
+            SUM(total_tokens) AS total_tokens
+        FROM request_records
+        {where_clause}
+        GROUP BY {group_key_expr}, {group_label_expr}
+        ORDER BY total_request_count DESC, total_tokens DESC, group_label ASC
+        LIMIT ?
+        "#
+    );
+
+    let rows = RequestBreakdownRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        sql,
+        values,
+    ))
+    .all(state.db())
+    .await
+    .map_err(|err| AppError::internal(err.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .map(RequestBreakdownView::from_row)
+        .collect())
+}
+
+async fn credential_model_groups_with_scope(
+    state: &AppState,
+    credentials: &[RequestBreakdownView],
+    api_key_id: Option<&str>,
+    only_failures: bool,
+    top: u64,
+) -> Result<Vec<CredentialModelBreakdownView>, AppError> {
+    let mut groups = Vec::with_capacity(credentials.len());
+
+    for credential in credentials {
+        let models = request_breakdown_with_scope(
+            state,
+            Some(credential.key.as_str()),
+            api_key_id,
+            only_failures,
+            BreakdownDimension::Model,
+            top,
+        )
+        .await?;
+
+        groups.push(CredentialModelBreakdownView {
+            credential: credential.clone(),
+            models,
+        });
+    }
+
+    Ok(groups)
 }
 
 async fn latest_request_errors_with_scope(
@@ -671,6 +1034,7 @@ async fn latest_request_errors_with_scope(
 fn build_where_clause(
     credential_id: Option<&str>,
     api_key_id: Option<&str>,
+    only_failures: bool,
 ) -> (String, Vec<SeaValue>) {
     let mut clauses = Vec::new();
     let mut values = Vec::new();
@@ -682,6 +1046,9 @@ fn build_where_clause(
     if let Some(api_key_id) = api_key_id {
         clauses.push("api_key_id = ?".to_string());
         values.push(api_key_id.to_string().into());
+    }
+    if only_failures {
+        clauses.push("request_success = 0".to_string());
     }
 
     let where_clause = if clauses.is_empty() {

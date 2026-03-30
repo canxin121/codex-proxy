@@ -23,6 +23,8 @@ use crate::models::StartDeviceCodeAuthRequest;
 use crate::models::StatsOverviewView;
 use crate::models::UpdateApiKeyRequest;
 use crate::models::UpdateCredentialRequest;
+use crate::models::UsageStatsQuery;
+use crate::models::UsageStatsView;
 use crate::request_stats::RequestObservation;
 use crate::request_stats::RequestRecordFinalization;
 use crate::request_stats::RequestRecordGuard;
@@ -37,6 +39,7 @@ use crate::request_stats::request_stats_for_api_key;
 use crate::request_stats::request_stats_for_credential;
 use crate::request_stats::start_request_record;
 use crate::request_stats::stats_overview;
+use crate::request_stats::usage_stats as query_usage_stats;
 use crate::state::AppState;
 use crate::state::AuthenticatedPrincipal;
 use crate::state::AuthenticatedPrincipalKind;
@@ -176,6 +179,7 @@ pub fn build_router(state: AppState) -> Router {
                 .delete(delete_api_key),
         )
         .route("/admin/stats/overview", get(get_stats_overview))
+        .route("/admin/stats/usage", get(get_usage_stats))
         .route("/admin/stats/requests", get(list_request_records_admin))
         .route(
             "/responses",
@@ -772,6 +776,15 @@ async fn list_request_records_admin(
 ) -> Result<Json<Vec<RequestRecordView>>, AppError> {
     require_admin(&state, &headers).await?;
     Ok(Json(query_request_records(&state, &query).await?))
+}
+
+async fn get_usage_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<UsageStatsQuery>,
+) -> Result<Json<UsageStatsView>, AppError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(query_usage_stats(&state, &query).await?))
 }
 
 async fn delete_api_key(
