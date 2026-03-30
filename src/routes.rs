@@ -941,6 +941,7 @@ async fn proxy_http(
             }
 
             if !finalized {
+                parser.finish(&mut observation);
                 let finalization = observation.finish_sse_response(status);
                 let _ = request_record.finalize(finalization.clone()).await;
                 let _ = sync_credential_transient_state(&state, &credential_id, &finalization).await;

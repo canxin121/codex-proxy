@@ -418,6 +418,16 @@ impl SseEventParser {
             process_sse_frame(&frame, observation);
         }
     }
+
+    pub fn finish(&mut self, observation: &mut RequestObservation) {
+        if self.buffer.trim().is_empty() {
+            self.buffer.clear();
+            return;
+        }
+
+        let frame = std::mem::take(&mut self.buffer);
+        process_sse_frame(&frame, observation);
+    }
 }
 
 pub async fn start_request_record(
@@ -1126,20 +1136,54 @@ fn extract_usage_json(value: &Value) -> Option<Value> {
 }
 
 fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
+    let input_tokens = extract_token_count(value, &["input_tokens", "prompt_tokens"])?;
+    let output_tokens = extract_token_count(value, &["output_tokens", "completion_tokens"])?;
+    let cached_input_tokens = extract_nested_token_count(
+        value,
+        &[("input_tokens_details", "cached_tokens"), ("prompt_tokens_details", "cached_tokens")],
+    )
+    .unwrap_or(0);
+    let reasoning_output_tokens = extract_nested_token_count(
+        value,
+        &[
+            ("output_tokens_details", "reasoning_tokens"),
+            ("completion_tokens_details", "reasoning_tokens"),
+        ],
+    )
+    .unwrap_or(0);
+    let total_tokens = extract_token_count(value, &["total_tokens"]).unwrap_or_else(|| {
+        let total = input_tokens + output_tokens + reasoning_output_tokens;
+        if total > 0 {
+            total
+        } else {
+            total + cached_input_tokens
+        }
+    });
+
     Some(TokenUsage {
-        input_tokens: value.get("input_tokens")?.as_i64()?,
-        cached_input_tokens: value
-            .get("input_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+        total_tokens,
+    })
+}
+
+fn extract_token_count(value: &Value, field_names: &[&str]) -> Option<i64> {
+    field_names
+        .iter()
+        .find_map(|field_name| value.get(field_name).and_then(Value::as_i64))
+}
+
+fn extract_nested_token_count(
+    value: &Value,
+    field_names: &[(&str, &str)],
+) -> Option<i64> {
+    field_names.iter().find_map(|(object_name, field_name)| {
+        value
+            .get(*object_name)
+            .and_then(|details| details.get(*field_name))
             .and_then(Value::as_i64)
-            .unwrap_or(0),
-        output_tokens: value.get("output_tokens")?.as_i64()?,
-        reasoning_output_tokens: value
-            .get("output_tokens_details")
-            .and_then(|details| details.get("reasoning_tokens"))
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-        total_tokens: value.get("total_tokens")?.as_i64()?,
     })
 }
 
@@ -1206,5 +1250,79 @@ mod tests {
         assert_eq!(finalization.upstream_status_code, Some(401));
         assert!(!finalization.request_success);
         assert_eq!(finalization.error_code.as_deref(), Some("invalid_api_key"));
+    }
+
+    #[test]
+    fn parse_token_usage_supports_openai_usage_shape() {
+        let usage = parse_token_usage(&json!({
+            "prompt_tokens": 12,
+            "prompt_tokens_details": {
+                "cached_tokens": 4
+            },
+            "completion_tokens": 7,
+            "completion_tokens_details": {
+                "reasoning_tokens": 3
+            },
+            "total_tokens": 22
+        }))
+        .expect("usage should parse");
+
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.cached_input_tokens, 4);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.reasoning_output_tokens, 3);
+        assert_eq!(usage.total_tokens, 22);
+    }
+
+    #[test]
+    fn request_observation_extracts_usage_from_wrapped_response() {
+        let mut observation = RequestObservation::new(None);
+        observation.observe_json_value(&json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_123",
+                "usage": {
+                    "input_tokens": 9,
+                    "input_tokens_details": {
+                        "cached_tokens": 2
+                    },
+                    "output_tokens": 5,
+                    "output_tokens_details": {
+                        "reasoning_tokens": 1
+                    },
+                    "total_tokens": 15
+                }
+            }
+        }));
+
+        let finalization = observation.finalize();
+        assert_eq!(finalization.response_id.as_deref(), Some("resp_123"));
+        let usage = finalization.usage.expect("usage should be recorded");
+        assert_eq!(usage.input_tokens, 9);
+        assert_eq!(usage.cached_input_tokens, 2);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.reasoning_output_tokens, 1);
+        assert_eq!(usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn sse_parser_finishes_last_frame_without_trailing_blank_line() {
+        let mut parser = SseEventParser::default();
+        let mut observation = RequestObservation::new(None);
+
+        parser.feed(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_456\",\"usage\":{\"input_tokens\":8,\"input_tokens_details\":{\"cached_tokens\":1},\"output_tokens\":4,\"output_tokens_details\":{\"reasoning_tokens\":2},\"total_tokens\":14}}}",
+            &mut observation,
+        );
+        parser.finish(&mut observation);
+
+        let finalization = observation.finalize();
+        let usage = finalization.usage.expect("usage should be recorded");
+        assert_eq!(finalization.response_id.as_deref(), Some("resp_456"));
+        assert_eq!(usage.input_tokens, 8);
+        assert_eq!(usage.cached_input_tokens, 1);
+        assert_eq!(usage.output_tokens, 4);
+        assert_eq!(usage.reasoning_output_tokens, 2);
+        assert_eq!(usage.total_tokens, 14);
     }
 }
