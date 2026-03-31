@@ -35,7 +35,7 @@ are reused from the local installation metadata.
 
 Example:
   curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/update.sh \
-    | bash -s -- --version v0.1.0
+    | bash -s -- --version v0.1.1
 EOF
 }
 
