@@ -6,11 +6,18 @@ VERSION="${CODEX_PROXY_VERSION:-}"
 TARGET_OVERRIDE="${CODEX_PROXY_TARGET:-}"
 INSTALL_BIN_DIR="${CODEX_PROXY_INSTALL_BIN_DIR:-$HOME/.local/bin}"
 INSTALL_SHARE_DIR="${CODEX_PROXY_INSTALL_SHARE_DIR:-$HOME/.local/share/codex-proxy}"
+CLEANUP_TMP_DIR=""
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "error: required command not found: $1" >&2
     exit 1
+  fi
+}
+
+cleanup_tmp_dir() {
+  if [[ -n "${CLEANUP_TMP_DIR}" ]]; then
+    rm -rf "${CLEANUP_TMP_DIR}"
   fi
 }
 
@@ -68,7 +75,7 @@ download_archive() {
   for target in "$@"; do
     archive_name="codex-proxy-${version}-${target}.${ext}"
     download_url="https://github.com/${REPO}/releases/download/${version}/${archive_name}"
-    echo "Trying ${archive_name} ..."
+    echo "Trying ${archive_name} ..." >&2
     if curl -fsSL "${download_url}" -o "${tmp_dir}/${archive_name}"; then
       printf '%s\t%s\n' "${target}" "${archive_name}"
       return 0
@@ -109,7 +116,8 @@ main() {
   fi
 
   tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "${tmp_dir}"' EXIT
+  CLEANUP_TMP_DIR="${tmp_dir}"
+  trap cleanup_tmp_dir EXIT
 
   if ! download_result="$(download_archive "${VERSION}" "${ext}" "${tmp_dir}" "${target_candidates[@]}")"; then
     echo "error: failed to download a release archive for ${VERSION}" >&2
