@@ -123,9 +123,11 @@ If `CODEX_PROXY_ADMIN_TOKEN` is not set, the service generates one at startup an
 - `GET /`
 - `GET /admin/credentials`
 - `POST /admin/credentials`
+- `POST /admin/credentials/import-json`
 - `GET /admin/credentials/:id`
 - `PATCH /admin/credentials/:id`
 - `DELETE /admin/credentials/:id`
+- `GET /admin/credentials/:id/export-json`
 - `POST /admin/credentials/:id/refresh`
 - `GET /admin/auth/sessions`
 - `GET /admin/auth/sessions/:id`
@@ -155,9 +157,17 @@ Proxy routes require either the admin token or a generated proxy API key.
 - `request_stats`
 - `last_request_error`
 
+List routes support `limit` and `offset`:
+
+- `GET /admin/credentials`
+- `GET /admin/api-keys`
+- `GET /admin/auth/sessions`
+- `GET /admin/stats/requests`
+
 The overview route returns global counters plus recent failures, and the request-record route supports these query parameters:
 
 - `limit`
+- `offset`
 - `credential_id`
 - `api_key_id`
 - `only_failures`
@@ -185,6 +195,29 @@ Create a credential record:
 
 This only creates the record. Actual auth is done separately through `/admin/auth/...`.
 
+## Credential JSON import/export
+
+Export an existing credential auth payload:
+
+```http
+GET /admin/credentials/:id/export-json
+```
+
+Import from JSON (`auth.json` payload only):
+
+```json
+POST /admin/credentials/import-json
+{
+  "auth_mode": "chatgpt",
+  "tokens": {
+    "id_token": "...",
+    "access_token": "...",
+    "refresh_token": "...",
+    "account_id": "..."
+  }
+}
+```
+
 ## Browser auth flow
 
 Start browser auth for an existing credential:
@@ -208,7 +241,7 @@ Then:
 2. Finish sign-in.
 3. Let the browser redirect to `auth_redirect_url`.
 4. Copy the full callback URL from the browser address bar.
-5. Submit it back through the API, the Browser Auth import modal, or the Auth Sessions page:
+5. Submit it back through the API or the Browser Auth import modal:
 
 ```json
 POST /admin/auth/browser/:auth_session_id/complete
@@ -217,7 +250,7 @@ POST /admin/auth/browser/:auth_session_id/complete
 }
 ```
 
-In the GUI, open the Browser Auth import modal and paste the callback URL into the manual completion field. You can also do the same from the matching Auth Session if you prefer the session ledger view.
+In the GUI, open the Browser Auth import modal and paste the callback URL into the manual completion field.
 
 ## Device-code auth flow
 

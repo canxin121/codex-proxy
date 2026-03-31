@@ -14,6 +14,7 @@ import {
   NInput,
   NInputNumber,
   NModal,
+  NPagination,
   NProgress,
   NRadioButton,
   NRadioGroup,
@@ -27,6 +28,7 @@ import {
 } from 'naive-ui'
 import {
   AddOutline,
+  DownloadOutline,
   RefreshOutline,
   OpenOutline,
   TrashOutline,
@@ -58,11 +60,15 @@ const dialog = useDialog()
 const loading = ref(false)
 const errorMessage = ref('')
 const credentials = ref<CredentialView[]>([])
+const totalCredentials = ref(0)
 const searchKeyword = ref('')
 const enabledOnly = ref(false)
+const page = ref(1)
+const pageSize = ref(20)
 const showFormModal = ref(false)
 const editingCredential = ref<CredentialView | null>(null)
-const importAuthMethod = ref<'browser' | 'device_code'>('browser')
+const importAuthMethod = ref<'browser' | 'device_code' | 'json'>('browser')
+const importJsonText = ref('')
 const showBrowserModal = ref(false)
 const browserSession = ref<AuthSessionView | null>(null)
 const browserCallbackUrl = ref('')
@@ -107,11 +113,26 @@ const filteredCredentials = computed(() => {
 })
 
 const summary = computed(() => ({
-  total: credentials.value.length,
+  total: totalCredentials.value,
+  pageCount: credentials.value.length,
   enabled: credentials.value.filter((item) => item.is_enabled).length,
   authenticated: credentials.value.filter((item) => item.credential_has_auth).length,
   failures: credentials.value.reduce((sum, item) => sum + item.request_stats.failure_request_count, 0),
 }))
+
+async function loadCredentialPage() {
+  const response = await api.listCredentials(session.apiContext, {
+    limit: pageSize.value,
+    offset: (page.value - 1) * pageSize.value,
+  })
+  const maxPage = Math.max(1, Math.ceil(response.total / pageSize.value))
+  if (page.value > maxPage) {
+    page.value = maxPage
+    return loadCredentialPage()
+  }
+  credentials.value = response.items
+  totalCredentials.value = response.total
+}
 
 function resetForm() {
   form.credential_name = ''
@@ -124,6 +145,7 @@ function resetForm() {
 function openCreateModal() {
   editingCredential.value = null
   importAuthMethod.value = 'browser'
+  importJsonText.value = ''
   showFormModal.value = true
 }
 
@@ -144,7 +166,7 @@ async function load() {
   loading.value = true
   errorMessage.value = ''
   try {
-    credentials.value = await api.listCredentials(session.apiContext)
+    await loadCredentialPage()
     await syncTrackedAuthSessions()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
@@ -209,11 +231,22 @@ async function syncTrackedAuthSessions() {
       syncTrackedSession(deviceSession.value, 'device'),
     ])
     if (browserChanged || deviceChanged) {
-      credentials.value = await api.listCredentials(session.apiContext)
+      await loadCredentialPage()
     }
   } finally {
     syncingTrackedSessions.value = false
   }
+}
+
+function handlePageChange(nextPage: number) {
+  page.value = nextPage
+  void load()
+}
+
+function handlePageSizeChange(nextPageSize: number) {
+  pageSize.value = nextPageSize
+  page.value = 1
+  void load()
 }
 
 async function submitForm() {
@@ -228,6 +261,10 @@ async function submitForm() {
       })
       message.success('凭证已更新')
     } else {
+      if (importAuthMethod.value === 'json') {
+        await importCredentialFromJson()
+        return
+      }
       const created = await api.createCredential(session.apiContext, {})
       showFormModal.value = false
       if (importAuthMethod.value === 'browser') {
@@ -242,6 +279,28 @@ async function submitForm() {
   } catch (error) {
     message.error(error instanceof Error ? error.message : String(error))
   }
+}
+
+async function importCredentialFromJson() {
+  const raw = importJsonText.value.trim()
+  if (!raw) {
+    message.error('请先粘贴凭证 JSON')
+    return
+  }
+
+  let parsed: Record<string, unknown>
+  try {
+    parsed = JSON.parse(raw) as Record<string, unknown>
+  } catch (error) {
+    message.error(error instanceof Error ? `JSON 解析失败：${error.message}` : 'JSON 解析失败')
+    return
+  }
+
+  const imported = await api.importCredentialJson(session.apiContext, parsed)
+  importJsonText.value = ''
+  showFormModal.value = false
+  message.success(`JSON 导入成功：${imported.credential_name}`)
+  await load()
 }
 
 async function refreshCredential(item: CredentialView) {
@@ -327,6 +386,32 @@ async function startDeviceAuth(item: CredentialView) {
   }
 }
 
+function exportFileName(item: CredentialView) {
+  const safeName =
+    item.credential_name
+      .trim()
+      .replace(/[^a-zA-Z0-9._-]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'credential'
+  return `${safeName}-${item.credential_id.slice(0, 8)}.json`
+}
+
+async function exportCredentialJson(item: CredentialView) {
+  try {
+    const payload = await api.exportCredentialJson(session.apiContext, item.credential_id)
+    const content = JSON.stringify(payload, null, 2)
+    const blob = new Blob([content], { type: 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = exportFileName(item)
+    anchor.click()
+    URL.revokeObjectURL(url)
+    message.success(`已导出 ${item.credential_name} 的 JSON`)
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : String(error))
+  }
+}
+
 async function copy(value: string, successText = '已复制') {
   try {
     await copyText(value)
@@ -354,7 +439,7 @@ onMounted(() => {
         <div class="page-kicker">Credential Pool</div>
         <h1 class="page-title display-font">凭证池、限额和认证入口</h1>
         <p class="page-subtitle">
-          这里负责导入和管理上游 ChatGPT Auth 凭证。导入时不需要手工填写名称，完成登录后会自动用 Codex 账号信息命名并托管到服务中。
+          管理 ChatGPT Auth 凭证，支持 Browser Auth、Device Code 和 JSON 导入。
         </p>
       </div>
       <n-space wrap>
@@ -377,16 +462,16 @@ onMounted(() => {
 
     <n-grid cols="1 s:2 xl:4" responsive="screen" :x-gap="18" :y-gap="18">
       <n-grid-item>
-        <metric-card title="凭证总数" :value="formatNumber(summary.total)" note="已创建凭证记录" />
+        <metric-card title="凭证总数" :value="formatNumber(summary.total)" note="服务内总记录数" />
       </n-grid-item>
       <n-grid-item>
-        <metric-card title="已启用" :value="formatNumber(summary.enabled)" note="可参与负载均衡" tone="success" />
+        <metric-card title="当前页启用" :value="formatNumber(summary.enabled)" note="当前页可参与负载均衡" tone="success" />
       </n-grid-item>
       <n-grid-item>
-        <metric-card title="已认证" :value="formatNumber(summary.authenticated)" note="存在 access / refresh token" tone="accent" />
+        <metric-card title="当前页已认证" :value="formatNumber(summary.authenticated)" note="存在 access / refresh token" tone="accent" />
       </n-grid-item>
       <n-grid-item>
-        <metric-card title="累计失败" :value="formatNumber(summary.failures)" note="来自请求记录聚合" tone="danger" />
+        <metric-card title="当前页失败" :value="formatNumber(summary.failures)" note="来自请求记录聚合" tone="danger" />
       </n-grid-item>
     </n-grid>
 
@@ -404,7 +489,9 @@ onMounted(() => {
             <n-switch v-model:value="enabledOnly" />
           </n-space>
         </n-space>
-        <div class="filter-label">当前展示 {{ formatNumber(filteredCredentials.length) }} 个凭证</div>
+        <div class="filter-label">
+          当前页 {{ formatNumber(filteredCredentials.length) }} / {{ formatNumber(summary.pageCount) }} · 总计 {{ formatNumber(summary.total) }}
+        </div>
       </n-space>
     </n-card>
 
@@ -523,6 +610,12 @@ onMounted(() => {
                 </template>
                 刷新
               </n-button>
+              <n-button secondary size="small" @click="exportCredentialJson(item)">
+                <template #icon>
+                  <n-icon><DownloadOutline /></n-icon>
+                </template>
+                导出 JSON
+              </n-button>
             </n-space>
             <n-space wrap>
               <n-button v-if="item.credential_has_auth" tertiary size="small" @click="openEditModal(item)">
@@ -543,6 +636,20 @@ onMounted(() => {
       </n-card>
     </div>
     <n-empty v-else description="没有匹配到任何凭证" class="empty-state app-shell-card" />
+
+    <n-card class="app-shell-card" :bordered="false">
+      <n-space justify="end">
+        <n-pagination
+          :page="page"
+          :page-size="pageSize"
+          :item-count="summary.total"
+          :page-sizes="[10, 20, 30, 50, 100]"
+          show-size-picker
+          @update:page="handlePageChange"
+          @update:page-size="handlePageSizeChange"
+        />
+      </n-space>
+    </n-card>
 
     <n-modal v-model:show="showFormModal" preset="card" style="width: min(680px, 96vw)" :title="editingCredential ? '编辑凭证' : '导入凭证'">
       <template v-if="editingCredential">
@@ -573,37 +680,60 @@ onMounted(() => {
       <template v-else>
         <n-space vertical size="large">
           <n-alert type="info" :show-icon="false">
-            导入时不需要填写凭证名称。系统会先创建一个导入记录，等你完成 Codex 登录后，自动用登录账号邮箱或账号 ID 作为凭证名称。
+            导入时不需要先填名称，登录完成后会自动同步账号信息。
           </n-alert>
 
           <n-thing title="选择导入方式">
             <template #description>
-              Browser Auth 适合当前浏览器直接完成登录。Device Code 适合在另一台设备或单独浏览器里输入 code。
+              Browser Auth：当前浏览器登录。Device Code：外部设备输入验证码。JSON：直接导入 auth.json。
             </template>
             <n-radio-group v-model:value="importAuthMethod">
               <n-space vertical size="medium">
                 <n-radio-button value="browser">Browser Auth</n-radio-button>
                 <n-radio-button value="device_code">Device Code</n-radio-button>
+                <n-radio-button value="json">JSON</n-radio-button>
               </n-space>
             </n-radio-group>
           </n-thing>
 
           <n-alert v-if="importAuthMethod === 'browser'" type="info" :show-icon="false">
-            Browser Auth 会使用会话里返回的本机 callback 地址。创建后会显示具体 URL；登录完成后，如果浏览器没有自动带回当前页面，请把地址栏里的完整 callback URL 粘贴到下面提交。
+            登录完成后，如果没有自动完成，请粘贴浏览器地址栏里的完整 callback URL。
+          </n-alert>
+          <n-alert v-else-if="importAuthMethod === 'json'" type="info" :show-icon="false">
+            仅支持 `auth.json` 内容。
           </n-alert>
 
           <div class="import-method-panel">
             <div class="import-method-panel__title">
-              {{ importAuthMethod === 'browser' ? 'Browser Auth' : 'Device Code' }}
+              {{
+                importAuthMethod === 'browser'
+                  ? 'Browser Auth'
+                  : importAuthMethod === 'device_code'
+                    ? 'Device Code'
+                    : 'JSON 导入'
+              }}
             </div>
             <div class="import-method-panel__body">
               {{
                 importAuthMethod === 'browser'
-                  ? '导入后会立刻生成授权链接和本机 callback URL。完成登录后，如果页面没有自动完成，请把完整 callback URL 粘贴到下面提交。'
-                  : '导入后会立刻生成 verification URL 和 user code。你完成输入后，后端会后台轮询直到授权完成。'
+                  ? '创建授权链接后完成登录，再提交 callback URL。'
+                  : importAuthMethod === 'device_code'
+                    ? '会生成 verification URL 和 user code，后端自动轮询完成。'
+                    : '粘贴 auth.json 后直接导入。'
               }}
             </div>
           </div>
+
+          <n-form v-if="importAuthMethod === 'json'" label-placement="top">
+            <n-form-item label="凭证 JSON">
+              <n-input
+                v-model:value="importJsonText"
+                type="textarea"
+                :autosize="{ minRows: 8, maxRows: 16 }"
+                placeholder='{"auth_mode":"chatgpt","tokens":{...}}'
+              />
+            </n-form-item>
+          </n-form>
         </n-space>
       </template>
       <template #action>
@@ -611,10 +741,24 @@ onMounted(() => {
           <n-button @click="showFormModal = false">取消</n-button>
           <n-button
             type="primary"
-            :disabled="editingCredential ? !form.credential_name.trim() : false"
+            :disabled="
+              editingCredential
+                ? !form.credential_name.trim()
+                : importAuthMethod === 'json'
+                  ? !importJsonText.trim()
+                  : false
+            "
             @click="submitForm"
           >
-            {{ editingCredential ? '保存修改' : importAuthMethod === 'browser' ? '开始 Browser Auth 导入' : '开始 Device Code 导入' }}
+            {{
+              editingCredential
+                ? '保存修改'
+                : importAuthMethod === 'browser'
+                  ? '开始 Browser Auth 导入'
+                  : importAuthMethod === 'device_code'
+                    ? '开始 Device Code 导入'
+                    : '导入 JSON 凭证'
+            }}
           </n-button>
         </n-space>
       </template>
@@ -625,9 +769,7 @@ onMounted(() => {
         <n-space vertical size="large">
           <n-thing title="1. 打开授权链接">
             <template #description>
-              在浏览器中完成登录。OpenAI 完成授权后会先回跳到
-              <span class="mono">{{ browserSession.auth_redirect_url }}</span>
-              ；如果浏览器没有自动完成，请把地址栏里的完整 callback URL 粘贴到下面提交。
+              在浏览器完成登录。若未自动完成，请手动提交 callback URL。
             </template>
             <n-space wrap>
               <n-button type="primary" tag="a" :href="browserSession.authorization_url ?? undefined" target="_blank">
@@ -640,9 +782,8 @@ onMounted(() => {
           </n-thing>
 
           <n-alert type="info" :show-icon="false">
-            本次 Browser Auth 使用的 callback 地址是
+            当前 callback 地址：
             <span class="mono">{{ browserSession.auth_redirect_url }}</span>
-            。请在登录结束后，把浏览器地址栏里的完整 URL 粘贴到下方提交。
           </n-alert>
 
           <n-space justify="space-between" wrap class="browser-status-line">
@@ -681,7 +822,7 @@ onMounted(() => {
 
           <n-thing title="2. 手动提交 callback URL">
             <template #description>
-              如果浏览器地址栏里已经是完整 callback URL，就直接粘贴到这里提交。
+              粘贴浏览器地址栏里的完整 callback URL。
             </template>
             <n-space vertical size="small">
               <n-input
@@ -736,7 +877,7 @@ onMounted(() => {
 
           <n-thing title="打开验证页">
             <template #description>
-              打开验证地址，输入 user code 后等待后端后台轮询完成。
+              打开验证地址并输入 user code。
             </template>
             <n-space wrap>
               <n-button type="primary" tag="a" :href="deviceSession.verification_url ?? undefined" target="_blank">

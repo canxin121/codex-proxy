@@ -16,8 +16,12 @@ use crate::models::CreateApiKeyRequest;
 use crate::models::CreateApiKeyResponse;
 use crate::models::CreateCredentialRequest;
 use crate::models::CredentialView;
+use crate::models::ExportCredentialJsonResponse;
 use crate::models::HealthResponse;
+use crate::models::ImportCredentialJsonRequest;
 use crate::models::ListRequestRecordsQuery;
+use crate::models::PaginatedResponse;
+use crate::models::PaginationQuery;
 use crate::models::RequestRecordView;
 use crate::models::StartBrowserAuthRequest;
 use crate::models::StartDeviceCodeAuthRequest;
@@ -75,11 +79,14 @@ use codex_client::TransportError;
 use codex_client::backoff;
 use codex_client::maybe_build_rustls_client_config_with_custom_ca;
 use codex_login::AuthManager;
+use codex_login::AuthMode as LoginAuthMode;
 use codex_login::CodexAuth;
 use codex_login::ServerOptions;
 use codex_login::complete_device_code_login;
 use codex_login::default_client::default_headers as codex_default_headers;
+use codex_login::load_auth_dot_json;
 use codex_login::request_device_code;
+use codex_login::save_auth;
 use futures::SinkExt;
 use futures::StreamExt;
 use rand::RngExt;
@@ -87,8 +94,10 @@ use rand::distr::Alphanumeric;
 use sea_orm::ActiveModelTrait;
 use sea_orm::ColumnTrait;
 use sea_orm::EntityTrait;
+use sea_orm::PaginatorTrait;
 use sea_orm::QueryFilter;
 use sea_orm::QueryOrder;
+use sea_orm::QuerySelect;
 use sea_orm::Set;
 use serde::Deserialize;
 use serde_json::Value;
@@ -145,6 +154,9 @@ struct ActiveWebsocketRequest {
     _lease: RequestLease,
 }
 
+const DEFAULT_LIST_LIMIT: u64 = 20;
+const MAX_LIST_LIMIT: u64 = 200;
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health))
@@ -157,10 +169,18 @@ pub fn build_router(state: AppState) -> Router {
             get(list_credentials).post(create_credential),
         )
         .route(
+            "/admin/credentials/import-json",
+            post(import_credential_json),
+        )
+        .route(
             "/admin/credentials/{id}",
             get(get_credential)
                 .patch(update_credential)
                 .delete(delete_credential),
+        )
+        .route(
+            "/admin/credentials/{id}/export-json",
+            get(export_credential_json),
         )
         .route("/admin/credentials/{id}/refresh", post(refresh_credential))
         .route("/admin/auth/sessions", get(list_auth_sessions))
@@ -263,10 +283,19 @@ async fn logout_admin_session(
 async fn list_credentials(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<CredentialView>>, AppError> {
+    Query(query): Query<PaginationQuery>,
+) -> Result<Json<PaginatedResponse<CredentialView>>, AppError> {
     require_admin(&state, &headers).await?;
-    let models = credential::Entity::find()
-        .order_by_asc(credential::Column::CreatedAt)
+    let (limit, offset) = normalize_pagination(&query, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+    let base_query = credential::Entity::find().order_by_asc(credential::Column::CreatedAt);
+    let total = base_query
+        .clone()
+        .count(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
+    let models = base_query
+        .offset(offset)
+        .limit(limit)
         .all(state.db())
         .await
         .map_err(|err| AppError::internal(err.to_string()))?;
@@ -276,7 +305,12 @@ async fn list_credentials(
         items.push(credential_to_view(&state, model).await?);
     }
 
-    Ok(Json(items))
+    Ok(Json(PaginatedResponse {
+        items,
+        total,
+        limit,
+        offset,
+    }))
 }
 
 async fn get_credential(
@@ -329,6 +363,87 @@ async fn create_credential(
     ))
 }
 
+async fn import_credential_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ImportCredentialJsonRequest>,
+) -> Result<(StatusCode, Json<CredentialView>), AppError> {
+    require_admin(&state, &headers).await?;
+    validate_imported_auth_json(&payload)?;
+
+    let now = Utc::now();
+    let credential_id = Uuid::new_v4().to_string();
+    let model = credential::ActiveModel {
+        id: Set(credential_id.clone()),
+        name: Set(format!("importing-{}", &credential_id[..8])),
+        kind: Set(crate::models::CredentialKind::ChatgptAuth
+            .as_str()
+            .to_string()),
+        enabled: Set(true),
+        selection_weight: Set(1),
+        notes: Set(None),
+        upstream_base_url: Set(None),
+        account_id: Set(None),
+        account_email: Set(None),
+        plan_type: Set(None),
+        last_used_at: Set(None),
+        last_limit_sync_at: Set(None),
+        last_refresh_at: Set(None),
+        last_error: Set(None),
+        failure_count: Set(0),
+        created_at: Set(now),
+        updated_at: Set(now),
+    };
+    model
+        .insert(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
+
+    if let Err(err) = save_auth(
+        &state.credential_home(&credential_id),
+        &payload,
+        codex_login::AuthCredentialsStoreMode::File,
+    ) {
+        rollback_imported_credential(&state, &credential_id).await;
+        return Err(AppError::bad_request(format!(
+            "invalid credential_auth_json: {err}"
+        )));
+    }
+
+    state.invalidate_auth_manager(&credential_id);
+    let synced = match state.sync_credential_from_auth(&credential_id).await {
+        Ok(model) => model,
+        Err(err) => {
+            rollback_imported_credential(&state, &credential_id).await;
+            return Err(AppError::bad_request(format!(
+                "credential_auth_json could not be loaded: {err}"
+            )));
+        }
+    };
+
+    Ok((
+        StatusCode::CREATED,
+        Json(credential_to_view(&state, synced).await?),
+    ))
+}
+
+async fn export_credential_json(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<ExportCredentialJsonResponse>, AppError> {
+    require_admin(&state, &headers).await?;
+    let model = find_credential(&state, &id).await?;
+    let auth_json = load_auth_dot_json(
+        &state.credential_home(&model.id),
+        codex_login::AuthCredentialsStoreMode::File,
+    )
+    .map_err(|err| AppError::internal(err.to_string()))?
+    .ok_or_else(|| AppError::not_found("credential auth is not available"))?;
+
+    Ok(Json(auth_json))
+}
+
 async fn update_credential(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -374,13 +489,7 @@ async fn delete_credential(
 ) -> Result<StatusCode, AppError> {
     require_admin(&state, &headers).await?;
     find_credential(&state, &id).await?;
-    cancel_pending_auth_sessions_for_credential(&state, &id).await?;
-
-    auth_session::Entity::delete_many()
-        .filter(auth_session::Column::CredentialId.eq(id.clone()))
-        .exec(state.db())
-        .await
-        .map_err(|err| AppError::internal(err.to_string()))?;
+    clear_auth_sessions_for_credential(&state, &id).await?;
 
     credential_limit::Entity::delete_many()
         .filter(credential_limit::Column::CredentialId.eq(id.clone()))
@@ -420,10 +529,19 @@ async fn refresh_credential(
 async fn list_auth_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<AuthSessionView>>, AppError> {
+    Query(query): Query<PaginationQuery>,
+) -> Result<Json<PaginatedResponse<AuthSessionView>>, AppError> {
     require_admin(&state, &headers).await?;
-    let models = auth_session::Entity::find()
-        .order_by_desc(auth_session::Column::CreatedAt)
+    let (limit, offset) = normalize_pagination(&query, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+    let base_query = auth_session::Entity::find().order_by_desc(auth_session::Column::CreatedAt);
+    let total = base_query
+        .clone()
+        .count(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
+    let models = base_query
+        .offset(offset)
+        .limit(limit)
         .all(state.db())
         .await
         .map_err(|err| AppError::internal(err.to_string()))?;
@@ -431,7 +549,12 @@ async fn list_auth_sessions(
         .into_iter()
         .map(auth_session_to_view)
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(items))
+    Ok(Json(PaginatedResponse {
+        items,
+        total,
+        limit,
+        offset,
+    }))
 }
 
 async fn get_auth_session(
@@ -451,7 +574,7 @@ async fn start_browser_auth(
 ) -> Result<(StatusCode, Json<AuthSessionView>), AppError> {
     require_admin(&state, &headers).await?;
     find_credential(&state, &payload.credential_id).await?;
-    cancel_pending_auth_sessions_for_credential(&state, &payload.credential_id).await?;
+    clear_auth_sessions_for_credential(&state, &payload.credential_id).await?;
 
     let redirect_uri = state.config().auth_callback_url.clone();
     let auth_start = auth_flow::start_browser_auth(state.config(), redirect_uri);
@@ -624,7 +747,7 @@ async fn start_device_code_auth(
 ) -> Result<(StatusCode, Json<AuthSessionView>), AppError> {
     require_admin(&state, &headers).await?;
     let credential = find_credential(&state, &payload.credential_id).await?;
-    cancel_pending_auth_sessions_for_credential(&state, &credential.id).await?;
+    clear_auth_sessions_for_credential(&state, &credential.id).await?;
 
     let opts = auth_server_options(&state, &credential.id);
     let device_code = request_device_code(&opts)
@@ -687,10 +810,19 @@ async fn cancel_auth_session(
 async fn list_api_keys(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<ApiKeyView>>, AppError> {
+    Query(query): Query<PaginationQuery>,
+) -> Result<Json<PaginatedResponse<ApiKeyView>>, AppError> {
     require_admin(&state, &headers).await?;
-    let models = api_key::Entity::find()
-        .order_by_asc(api_key::Column::CreatedAt)
+    let (limit, offset) = normalize_pagination(&query, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+    let base_query = api_key::Entity::find().order_by_asc(api_key::Column::CreatedAt);
+    let total = base_query
+        .clone()
+        .count(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
+    let models = base_query
+        .offset(offset)
+        .limit(limit)
         .all(state.db())
         .await
         .map_err(|err| AppError::internal(err.to_string()))?;
@@ -698,7 +830,12 @@ async fn list_api_keys(
     for model in models {
         items.push(api_key_to_view(&state, model).await?);
     }
-    Ok(Json(items))
+    Ok(Json(PaginatedResponse {
+        items,
+        total,
+        limit,
+        offset,
+    }))
 }
 
 async fn get_api_key(
@@ -782,7 +919,7 @@ async fn list_request_records_admin(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<ListRequestRecordsQuery>,
-) -> Result<Json<Vec<RequestRecordView>>, AppError> {
+) -> Result<Json<PaginatedResponse<RequestRecordView>>, AppError> {
     require_admin(&state, &headers).await?;
     Ok(Json(query_request_records(&state, &query).await?))
 }
@@ -970,9 +1107,7 @@ async fn proxy_http(
     };
 
     let mut observation = RequestObservation::new(requested_model);
-    if let Ok(value) = serde_json::from_slice::<Value>(&body_bytes) {
-        observation.observe_json_value(&value);
-    }
+    observation.observe_body_bytes(&body_bytes);
     let finalization = observation.finish_http_response(status);
     request_record.finalize(finalization.clone()).await?;
     sync_credential_transient_state(state, &selected.model.id, &finalization).await?;
@@ -1010,9 +1145,7 @@ async fn proxy_responses_ws(
                     .update_rate_limits_from_headers(&credential.id, &failure.headers)
                     .await?;
                 let mut observation = RequestObservation::new(None);
-                if let Ok(value) = serde_json::from_slice::<Value>(&failure.body) {
-                    observation.observe_json_value(&value);
-                }
+                observation.observe_body_bytes(&failure.body);
                 let finalization = observation.finish_http_response(failure.status);
                 request_record.finalize(finalization.clone()).await?;
                 sync_credential_transient_state(&state, &credential.id, &finalization).await?;
@@ -1502,10 +1635,8 @@ async fn map_upstream_ws_message(
     match message {
         UpstreamWsMessage::Text(text) => {
             sync_rate_limits_from_ws_text(state, credential_id, text.as_str()).await?;
-            if let Some(observation) = observation
-                && let Ok(value) = serde_json::from_str::<Value>(text.as_str())
-            {
-                observation.observe_json_value(&value);
+            if let Some(observation) = observation {
+                observation.observe_body_bytes(text.as_bytes());
             }
             Ok(Some(ClientWsMessage::Text(text.to_string().into())))
         }
@@ -1735,25 +1866,12 @@ fn normalize_prompt_cache_key_for_request(
 }
 
 fn resolve_session_key_from_headers(headers: &HeaderMap) -> Option<String> {
-    const CANDIDATE_HEADERS: &[&str] = &[
-        "x-client-request-id",
-        "session_id",
-        "conversation_id",
-        "x-session-id",
-        "session-id",
-        "conversation-id",
-        "conversationid",
-        "sessionid",
-    ];
-
-    CANDIDATE_HEADERS.iter().find_map(|name| {
-        headers
-            .get(*name)
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    })
+    headers
+        .get("x-client-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn set_prompt_cache_headers(headers: &mut HeaderMap, prompt_cache_key: &str) {
@@ -1764,11 +1882,6 @@ fn set_prompt_cache_headers(headers: &mut HeaderMap, prompt_cache_key: &str) {
     insert_header_value(
         headers,
         "x-client-request-id".to_string(),
-        prompt_cache_key.to_string(),
-    );
-    insert_header_value(
-        headers,
-        "session_id".to_string(),
         prompt_cache_key.to_string(),
     );
 }
@@ -2235,6 +2348,15 @@ async fn api_key_to_view(state: &AppState, model: api_key::Model) -> Result<ApiK
     ))
 }
 
+fn normalize_pagination(query: &PaginationQuery, default_limit: u64, max_limit: u64) -> (u64, u64) {
+    let limit = query
+        .limit
+        .unwrap_or(default_limit)
+        .clamp(1, max_limit.max(1));
+    let offset = query.offset.unwrap_or(0);
+    (limit, offset)
+}
+
 fn auth_session_to_view(model: auth_session::Model) -> Result<AuthSessionView, AppError> {
     AuthSessionView::from_model(model)
         .ok_or_else(|| AppError::internal("failed to render auth session view"))
@@ -2262,6 +2384,54 @@ async fn find_api_key(state: &AppState, id: &str) -> Result<api_key::Model, AppE
         .await
         .map_err(|err| AppError::internal(err.to_string()))?
         .ok_or_else(|| AppError::not_found("api key not found"))
+}
+
+fn validate_imported_auth_json(auth_json: &codex_login::AuthDotJson) -> Result<(), AppError> {
+    if matches!(auth_json.auth_mode, Some(LoginAuthMode::ApiKey)) {
+        return Err(AppError::bad_request(
+            "credential_auth_json must contain ChatGPT auth tokens, not API key mode",
+        ));
+    }
+
+    let tokens = auth_json.tokens.as_ref().ok_or_else(|| {
+        AppError::bad_request("credential_auth_json is missing tokens; expected ChatGPT auth")
+    })?;
+    if tokens.access_token.trim().is_empty() {
+        return Err(AppError::bad_request(
+            "credential_auth_json.tokens.access_token must not be empty",
+        ));
+    }
+    if tokens.refresh_token.trim().is_empty() {
+        return Err(AppError::bad_request(
+            "credential_auth_json.tokens.refresh_token must not be empty",
+        ));
+    }
+    if tokens.id_token.raw_jwt.trim().is_empty() {
+        return Err(AppError::bad_request(
+            "credential_auth_json.tokens.id_token must not be empty",
+        ));
+    }
+
+    Ok(())
+}
+
+async fn rollback_imported_credential(state: &AppState, credential_id: &str) {
+    state.invalidate_auth_manager(credential_id);
+    let _ = auth_session::Entity::delete_many()
+        .filter(auth_session::Column::CredentialId.eq(credential_id.to_string()))
+        .exec(state.db())
+        .await;
+    let _ = credential_limit::Entity::delete_many()
+        .filter(credential_limit::Column::CredentialId.eq(credential_id.to_string()))
+        .exec(state.db())
+        .await;
+    let _ = credential::Entity::delete_by_id(credential_id.to_string())
+        .exec(state.db())
+        .await;
+    let home = state.credential_home(credential_id);
+    if home.exists() {
+        let _ = std::fs::remove_dir_all(home);
+    }
 }
 
 async fn find_pending_browser_auth_session_by_state(
@@ -2505,23 +2675,33 @@ async fn mark_auth_session_failed(
     Ok(())
 }
 
-async fn cancel_pending_auth_sessions_for_credential(
+async fn clear_auth_sessions_for_credential(
     state: &AppState,
     credential_id: &str,
 ) -> Result<(), AppError> {
-    let pending_sessions = auth_session::Entity::find()
+    let sessions = auth_session::Entity::find()
         .filter(auth_session::Column::CredentialId.eq(credential_id.to_string()))
-        .filter(auth_session::Column::Status.eq(AuthStatus::Pending.as_str()))
         .all(state.db())
         .await
         .map_err(|err| AppError::internal(err.to_string()))?;
 
-    for session in pending_sessions {
-        if let Some(cancellation) = state.take_auth_cancellation(&session.id) {
+    if sessions.is_empty() {
+        return Ok(());
+    }
+
+    for session in &sessions {
+        if session.status == AuthStatus::Pending.as_str()
+            && let Some(cancellation) = state.take_auth_cancellation(&session.id)
+        {
             cancellation.cancel();
         }
-        let _ = set_auth_session_status(state, &session.id, AuthStatus::Cancelled, None).await?;
     }
+
+    auth_session::Entity::delete_many()
+        .filter(auth_session::Column::CredentialId.eq(credential_id.to_string()))
+        .exec(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
 
     Ok(())
 }
@@ -2662,6 +2842,40 @@ fn is_reserved_api_prefix(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn sample_import_auth_json() -> codex_login::AuthDotJson {
+        let mut tokens = codex_login::TokenData::default();
+        tokens.access_token = "access-token".to_string();
+        tokens.refresh_token = "refresh-token".to_string();
+        tokens.id_token.raw_jwt = "header.payload.signature".to_string();
+
+        codex_login::AuthDotJson {
+            auth_mode: Some(LoginAuthMode::Chatgpt),
+            openai_api_key: None,
+            tokens: Some(tokens),
+            last_refresh: None,
+        }
+    }
+
+    #[test]
+    fn validate_imported_auth_json_rejects_api_key_mode() {
+        let mut auth_json = sample_import_auth_json();
+        auth_json.auth_mode = Some(LoginAuthMode::ApiKey);
+
+        match validate_imported_auth_json(&auth_json) {
+            Err(AppError::BadRequest(message)) => {
+                assert!(message.contains("not API key mode"));
+            }
+            Err(err) => panic!("unexpected error kind: {err}"),
+            Ok(_) => panic!("expected API key mode to fail validation"),
+        }
+    }
+
+    #[test]
+    fn validate_imported_auth_json_accepts_chatgpt_tokens() {
+        let auth_json = sample_import_auth_json();
+        assert!(validate_imported_auth_json(&auth_json).is_ok());
+    }
+
     #[test]
     fn request_header_filter_removes_proxy_internal_header() {
         assert!(should_skip_request_header("x-codex-proxy-credential-id"));
@@ -2745,10 +2959,6 @@ mod tests {
             "x-client-request-id",
             http::HeaderValue::from_static("old-request-id"),
         );
-        headers.insert(
-            "session_id",
-            http::HeaderValue::from_static("old-session-id"),
-        );
         set_prompt_cache_headers(&mut headers, &key);
 
         assert_eq!(
@@ -2757,22 +2967,13 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("custom-cache-key")
         );
-        assert_eq!(
-            headers
-                .get("session_id")
-                .and_then(|value| value.to_str().ok()),
-            Some("custom-cache-key")
-        );
     }
 
     #[test]
-    fn session_key_resolution_prefers_client_request_id_then_session_aliases() {
+    fn session_key_resolution_requires_client_request_id_header() {
         let mut headers = HeaderMap::new();
         headers.insert("session_id", http::HeaderValue::from_static("session-only"));
-        assert_eq!(
-            resolve_session_key_from_headers(&headers).as_deref(),
-            Some("session-only")
-        );
+        assert!(resolve_session_key_from_headers(&headers).is_none());
 
         headers.insert(
             "x-client-request-id",
@@ -2784,15 +2985,7 @@ mod tests {
         );
 
         headers.remove("x-client-request-id");
-        headers.remove("session_id");
-        headers.insert(
-            "conversation_id",
-            http::HeaderValue::from_static("conversation-fallback"),
-        );
-        assert_eq!(
-            resolve_session_key_from_headers(&headers).as_deref(),
-            Some("conversation-fallback")
-        );
+        assert!(resolve_session_key_from_headers(&headers).is_none());
     }
 
     #[test]

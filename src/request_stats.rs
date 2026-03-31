@@ -7,6 +7,7 @@ use crate::models::AuthStatus;
 use crate::models::CredentialModelBreakdownView;
 use crate::models::LastRequestErrorView;
 use crate::models::ListRequestRecordsQuery;
+use crate::models::PaginatedResponse;
 use crate::models::RequestBreakdownRow;
 use crate::models::RequestBreakdownView;
 use crate::models::RequestDurationAggregateRow;
@@ -241,6 +242,61 @@ impl RequestObservation {
 
     pub fn observe_json_value(&mut self, value: &Value) {
         self.observe_event_value(None, value);
+    }
+
+    pub fn observe_body_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+
+        if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+            match value {
+                Value::Array(events) => {
+                    for event in events {
+                        self.observe_json_value(&event);
+                    }
+                }
+                other => {
+                    self.observe_json_value(&other);
+                }
+            }
+
+            if self.response_id.is_some() || self.usage_json.is_some() || self.success.is_some() {
+                return;
+            }
+        }
+
+        self.observe_text_payload(&String::from_utf8_lossy(bytes));
+    }
+
+    fn observe_text_payload(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+
+        let mut parser = SseEventParser::default();
+        parser.feed(text.as_bytes(), self);
+        parser.finish(self);
+        if self.response_id.is_some() || self.usage_json.is_some() || self.success.is_some() {
+            return;
+        }
+
+        for raw_line in text.lines() {
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let line = trimmed
+                .strip_prefix("data:")
+                .map(str::trim_start)
+                .unwrap_or(trimmed);
+            if line.is_empty() || line == "[DONE]" {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(line) {
+                self.observe_json_value(&value);
+            }
+        }
     }
 
     pub fn observe_event_value(&mut self, explicit_kind: Option<&str>, value: &Value) {
@@ -673,7 +729,7 @@ pub async fn latest_request_errors(
 pub async fn list_request_records(
     state: &AppState,
     query: &ListRequestRecordsQuery,
-) -> Result<Vec<RequestRecordView>, AppError> {
+) -> Result<PaginatedResponse<RequestRecordView>, AppError> {
     let mut select = request_record::Entity::find()
         .order_by_desc(request_record::Column::RequestStartedAt)
         .order_by_desc(request_record::Column::CreatedAt);
@@ -692,17 +748,29 @@ pub async fn list_request_records(
         .limit
         .unwrap_or(DEFAULT_REQUEST_RECORD_LIMIT)
         .clamp(1, MAX_REQUEST_RECORD_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    let total = select
+        .clone()
+        .count(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
 
     let models = select
+        .offset(offset)
         .limit(limit)
         .all(state.db())
         .await
         .map_err(|err| AppError::internal(err.to_string()))?;
 
-    Ok(models
-        .into_iter()
-        .map(RequestRecordView::from_model)
-        .collect())
+    Ok(PaginatedResponse {
+        items: models
+            .into_iter()
+            .map(RequestRecordView::from_model)
+            .collect(),
+        total,
+        limit,
+        offset,
+    })
 }
 
 pub async fn stats_overview(state: &AppState) -> Result<StatsOverviewView, AppError> {
@@ -1179,30 +1247,64 @@ fn extract_response_id(value: &Value) -> Option<String> {
 fn extract_usage_json(value: &Value) -> Option<Value> {
     response_container(value)
         .get("usage")
+        .or_else(|| value.get("usage"))
+        .or_else(|| response_container(value).get("token_usage"))
+        .or_else(|| value.get("token_usage"))
         .filter(|usage| !usage.is_null())
         .cloned()
 }
 
 fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
-    let input_tokens = extract_token_count(value, &["input_tokens", "prompt_tokens"])?;
-    let output_tokens = extract_token_count(value, &["output_tokens", "completion_tokens"])?;
-    let cached_input_tokens = extract_nested_token_count(
+    let input_tokens = extract_token_count(value, &["input_tokens", "prompt_tokens"]).unwrap_or(0);
+    let output_tokens =
+        extract_token_count(value, &["output_tokens", "completion_tokens"]).unwrap_or(0);
+    let cached_input_tokens = extract_token_count(
         value,
         &[
-            ("input_tokens_details", "cached_tokens"),
-            ("prompt_tokens_details", "cached_tokens"),
+            "cached_input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
         ],
     )
+    .or_else(|| {
+        extract_nested_token_count(
+            value,
+            &[
+                ("input_tokens_details", "cached_tokens"),
+                ("prompt_tokens_details", "cached_tokens"),
+            ],
+        )
+    })
     .unwrap_or(0);
-    let reasoning_output_tokens = extract_nested_token_count(
+    let reasoning_output_tokens = extract_token_count(
         value,
         &[
-            ("output_tokens_details", "reasoning_tokens"),
-            ("completion_tokens_details", "reasoning_tokens"),
+            "reasoning_output_tokens",
+            "reasoning_tokens",
+            "thinking_tokens",
         ],
     )
+    .or_else(|| {
+        extract_nested_token_count(
+            value,
+            &[
+                ("output_tokens_details", "reasoning_tokens"),
+                ("completion_tokens_details", "reasoning_tokens"),
+            ],
+        )
+    })
     .unwrap_or(0);
-    let total_tokens = extract_token_count(value, &["total_tokens"]).unwrap_or_else(|| {
+    let explicit_total_tokens = extract_token_count(value, &["total_tokens"]);
+    if input_tokens == 0
+        && output_tokens == 0
+        && cached_input_tokens == 0
+        && reasoning_output_tokens == 0
+        && explicit_total_tokens.unwrap_or(0) == 0
+    {
+        return None;
+    }
+
+    let total_tokens = explicit_total_tokens.unwrap_or_else(|| {
         let total = input_tokens + output_tokens + reasoning_output_tokens;
         if total > 0 {
             total
@@ -1223,7 +1325,7 @@ fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
 fn extract_token_count(value: &Value, field_names: &[&str]) -> Option<i64> {
     field_names
         .iter()
-        .find_map(|field_name| value.get(field_name).and_then(Value::as_i64))
+        .find_map(|field_name| value.get(field_name).and_then(parse_token_count_from_value))
 }
 
 fn extract_nested_token_count(value: &Value, field_names: &[(&str, &str)]) -> Option<i64> {
@@ -1231,8 +1333,24 @@ fn extract_nested_token_count(value: &Value, field_names: &[(&str, &str)]) -> Op
         value
             .get(*object_name)
             .and_then(|details| details.get(*field_name))
-            .and_then(Value::as_i64)
+            .and_then(parse_token_count_from_value)
     })
+}
+
+fn parse_token_count_from_value(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok()))
+            .or_else(|| number.as_f64().map(|value| value.round() as i64)),
+        Value::String(raw) => raw.trim().parse::<i64>().ok().or_else(|| {
+            raw.trim()
+                .parse::<f64>()
+                .ok()
+                .map(|value| value.round() as i64)
+        }),
+        _ => None,
+    }
 }
 
 fn extract_error_code(value: &Value) -> Option<String> {
@@ -1323,6 +1441,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_token_usage_supports_direct_cached_and_reasoning_shape() {
+        let usage = parse_token_usage(&json!({
+            "input_tokens": "19",
+            "cached_input_tokens": 6,
+            "output_tokens": "11",
+            "reasoning_output_tokens": "4",
+            "total_tokens": "34"
+        }))
+        .expect("usage should parse");
+
+        assert_eq!(usage.input_tokens, 19);
+        assert_eq!(usage.cached_input_tokens, 6);
+        assert_eq!(usage.output_tokens, 11);
+        assert_eq!(usage.reasoning_output_tokens, 4);
+        assert_eq!(usage.total_tokens, 34);
+    }
+
+    #[test]
     fn request_observation_extracts_usage_from_wrapped_response() {
         let mut observation = RequestObservation::new(None);
         observation.observe_json_value(&json!({
@@ -1372,5 +1508,61 @@ mod tests {
         assert_eq!(usage.output_tokens, 4);
         assert_eq!(usage.reasoning_output_tokens, 2);
         assert_eq!(usage.total_tokens, 14);
+    }
+
+    #[test]
+    fn request_observation_extracts_usage_from_top_level_usage_with_response_wrapper() {
+        let mut observation = RequestObservation::new(None);
+        observation.observe_json_value(&json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_top"
+            },
+            "usage": {
+                "input_tokens": 7,
+                "output_tokens": 3,
+                "total_tokens": 10
+            }
+        }));
+
+        let finalization = observation.finalize();
+        assert_eq!(finalization.response_id.as_deref(), Some("resp_top"));
+        let usage = finalization.usage.expect("usage should be recorded");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.total_tokens, 10);
+    }
+
+    #[test]
+    fn request_observation_body_parser_handles_sse_payload_without_content_type_hint() {
+        let mut observation = RequestObservation::new(None);
+        observation.observe_body_bytes(
+            b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_sse\",\"usage\":{\"input_tokens\":17,\"input_tokens_details\":{\"cached_tokens\":5},\"output_tokens\":9,\"output_tokens_details\":{\"reasoning_tokens\":2},\"total_tokens\":28}}}\n\n",
+        );
+
+        let finalization = observation.finalize();
+        let usage = finalization.usage.expect("usage should be recorded");
+        assert_eq!(finalization.response_id.as_deref(), Some("resp_sse"));
+        assert_eq!(usage.input_tokens, 17);
+        assert_eq!(usage.cached_input_tokens, 5);
+        assert_eq!(usage.output_tokens, 9);
+        assert_eq!(usage.reasoning_output_tokens, 2);
+        assert_eq!(usage.total_tokens, 28);
+    }
+
+    #[test]
+    fn request_observation_body_parser_handles_jsonl_data_lines() {
+        let mut observation = RequestObservation::new(None);
+        observation.observe_body_bytes(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_jsonl\",\"status\":\"in_progress\"}}\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_jsonl\",\"usage\":{\"input_tokens\":13,\"output_tokens\":8,\"total_tokens\":21}}}\n",
+        );
+
+        let finalization = observation.finalize();
+        assert_eq!(finalization.response_id.as_deref(), Some("resp_jsonl"));
+        let usage = finalization.usage.expect("usage should be recorded");
+        assert_eq!(usage.input_tokens, 13);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.total_tokens, 21);
     }
 }

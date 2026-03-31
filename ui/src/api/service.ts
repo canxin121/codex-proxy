@@ -10,7 +10,11 @@ import type {
   CreateApiKeyResponse,
   CreateCredentialPayload,
   CredentialView,
+  ExportCredentialJsonResponse,
   HealthResponse,
+  ImportCredentialJsonPayload,
+  PaginatedResponse,
+  PaginationQuery,
   RequestQuery,
   RequestRecordView,
   StartBrowserAuthPayload,
@@ -40,14 +44,31 @@ export const api = {
       method: 'POST',
     })
   },
-  listCredentials(context: ApiContext) {
-    return apiRequest<CredentialView[]>(context, '/admin/credentials')
+  listCredentials(context: ApiContext, query: PaginationQuery = {}) {
+    return apiRequest<PaginatedResponse<CredentialView>>(
+      context,
+      '/admin/credentials',
+      {},
+      query as Record<string, string | number | boolean | undefined>,
+    )
   },
   createCredential(context: ApiContext, payload: CreateCredentialPayload) {
     return apiRequest<CredentialView>(context, '/admin/credentials', {
       method: 'POST',
       body: JSON.stringify(payload),
     })
+  },
+  importCredentialJson(context: ApiContext, payload: ImportCredentialJsonPayload) {
+    return apiRequest<CredentialView>(context, '/admin/credentials/import-json', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  exportCredentialJson(context: ApiContext, credentialId: string) {
+    return apiRequest<ExportCredentialJsonResponse>(
+      context,
+      `/admin/credentials/${credentialId}/export-json`,
+    )
   },
   updateCredential(context: ApiContext, credentialId: string, payload: UpdateCredentialPayload) {
     return apiRequest<CredentialView>(context, `/admin/credentials/${credentialId}`, {
@@ -65,8 +86,13 @@ export const api = {
       method: 'POST',
     })
   },
-  listAuthSessions(context: ApiContext) {
-    return apiRequest<AuthSessionView[]>(context, '/admin/auth/sessions')
+  listAuthSessions(context: ApiContext, query: PaginationQuery = {}) {
+    return apiRequest<PaginatedResponse<AuthSessionView>>(
+      context,
+      '/admin/auth/sessions',
+      {},
+      query as Record<string, string | number | boolean | undefined>,
+    )
   },
   getAuthSession(context: ApiContext, authSessionId: string) {
     return apiRequest<AuthSessionView>(context, `/admin/auth/sessions/${authSessionId}`)
@@ -94,8 +120,13 @@ export const api = {
       method: 'POST',
     })
   },
-  listApiKeys(context: ApiContext) {
-    return apiRequest<ApiKeyView[]>(context, '/admin/api-keys')
+  listApiKeys(context: ApiContext, query: PaginationQuery = {}) {
+    return apiRequest<PaginatedResponse<ApiKeyView>>(
+      context,
+      '/admin/api-keys',
+      {},
+      query as Record<string, string | number | boolean | undefined>,
+    )
   },
   createApiKey(context: ApiContext, payload: CreateApiKeyPayload) {
     return apiRequest<CreateApiKeyResponse>(context, '/admin/api-keys', {
@@ -126,7 +157,7 @@ export const api = {
     )
   },
   listRequestRecords(context: ApiContext, query: RequestQuery) {
-    return apiRequest<RequestRecordView[]>(
+    return apiRequest<PaginatedResponse<RequestRecordView>>(
       context,
       '/admin/stats/requests',
       {},

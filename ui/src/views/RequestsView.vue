@@ -10,6 +10,7 @@ import {
   NGridItem,
   NIcon,
   NInputNumber,
+  NPagination,
   NSelect,
   NSpace,
   NSwitch,
@@ -42,7 +43,9 @@ const usage = ref<UsageStatsView | null>(null)
 const credentialFilter = ref<string | null>(null)
 const apiKeyFilter = ref<string | null>(null)
 const onlyFailures = ref(false)
-const limit = ref(100)
+const page = ref(1)
+const pageSize = ref(100)
+const totalRecords = ref(0)
 const selectedRecord = ref<RequestRecordView | null>(null)
 
 const showDetailDrawer = computed({
@@ -152,24 +155,48 @@ async function load() {
     const [recordResponse, usageResponse, credentialResponse, apiKeyResponse] = await Promise.all([
       api.listRequestRecords(session.apiContext, {
         ...query,
-        limit: limit.value,
+        limit: pageSize.value,
+        offset: (page.value - 1) * pageSize.value,
       }),
       api.getUsageStats(session.apiContext, {
         ...query,
         top: 8,
       }),
-      api.listCredentials(session.apiContext),
-      api.listApiKeys(session.apiContext),
+      api.listCredentials(session.apiContext, { limit: 1000, offset: 0 }),
+      api.listApiKeys(session.apiContext, { limit: 1000, offset: 0 }),
     ])
-    records.value = recordResponse
+    const maxPage = Math.max(1, Math.ceil(recordResponse.total / pageSize.value))
+    if (page.value > maxPage) {
+      page.value = maxPage
+      await load()
+      return
+    }
+    records.value = recordResponse.items
+    totalRecords.value = recordResponse.total
     usage.value = usageResponse
-    credentials.value = credentialResponse
-    apiKeys.value = apiKeyResponse
+    credentials.value = credentialResponse.items
+    apiKeys.value = apiKeyResponse.items
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   } finally {
     loading.value = false
   }
+}
+
+function applyFilters() {
+  page.value = 1
+  void load()
+}
+
+function handlePageChange(nextPage: number) {
+  page.value = nextPage
+  void load()
+}
+
+function handlePageSizeChange(nextPageSize: number) {
+  pageSize.value = nextPageSize
+  page.value = 1
+  void load()
 }
 
 useAutoRefresh(
@@ -190,7 +217,7 @@ onMounted(() => {
         <div class="page-kicker">Request Journal</div>
         <h1 class="page-title display-font">当前筛选范围的统计剖面 + 逐请求明细</h1>
         <p class="page-subtitle">
-          这里不再只是表格。每次筛选都会同步刷新聚合统计，让你直接看出当前范围里哪个模型、哪个路径、哪个状态码或错误阶段最突出。
+          按筛选条件查看聚合统计和逐请求明细。
         </p>
       </div>
       <n-button secondary type="primary" :loading="loading" @click="load">
@@ -220,13 +247,13 @@ onMounted(() => {
             placeholder="筛选 API key"
             style="width: 220px"
           />
-          <n-input-number v-model:value="limit" :min="1" :max="1000" :precision="0" />
+          <n-input-number v-model:value="pageSize" :min="10" :max="500" :precision="0" />
           <n-space align="center">
             <span class="filter-label">只看失败</span>
             <n-switch v-model:value="onlyFailures" />
           </n-space>
         </n-space>
-        <n-button type="primary" secondary @click="load">应用筛选</n-button>
+        <n-button type="primary" secondary @click="applyFilters">应用筛选</n-button>
       </n-space>
     </n-card>
 
@@ -236,7 +263,7 @@ onMounted(() => {
           <metric-card
             title="筛选范围请求数"
             :value="formatNumber(usage.summary.total_request_count)"
-            :note="`当前列表已加载 ${formatNumber(records.length)} 条，limit = ${formatNumber(limit)}`"
+            :note="`当前页 ${formatNumber(records.length)} 条，共 ${formatNumber(totalRecords)} 条`"
             tone="accent"
           />
         </n-grid-item>
@@ -345,7 +372,7 @@ onMounted(() => {
             </div>
           </div>
           <n-tag round type="default">
-            limit {{ formatNumber(limit) }}
+            第 {{ formatNumber(page) }} 页 · 每页 {{ formatNumber(pageSize) }} 条
           </n-tag>
         </div>
       </template>
@@ -403,6 +430,8 @@ onMounted(() => {
                 <div class="cell-meta">总量 {{ formatNumber(item.token_usage.all_tokens) }}</div>
                 <div class="cell-meta">输入 {{ formatNumber(item.token_usage.read_input_tokens) }}</div>
                 <div class="cell-meta">缓存 {{ formatNumber(item.token_usage.cache_read_input_tokens) }}</div>
+                <div class="cell-meta">输出 {{ formatNumber(item.token_usage.write_output_tokens) }}</div>
+                <div class="cell-meta">推理 {{ formatNumber(item.token_usage.write_reasoning_tokens) }}</div>
               </td>
               <td>
                 <n-button tertiary size="small" @click="selectedRecord = item">
@@ -417,6 +446,18 @@ onMounted(() => {
         </n-table>
       </template>
       <n-empty v-else description="没有匹配到任何请求记录" />
+
+      <div class="table-pagination">
+        <n-pagination
+          :page="page"
+          :page-size="pageSize"
+          :item-count="totalRecords"
+          :page-sizes="[20, 50, 100, 200, 500]"
+          show-size-picker
+          @update:page="handlePageChange"
+          @update:page-size="handlePageSizeChange"
+        />
+      </div>
     </n-card>
 
     <n-drawer v-model:show="showDetailDrawer" placement="right" :width="520">
@@ -549,10 +590,20 @@ onMounted(() => {
   font-size: 12px;
 }
 
+.table-pagination {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+
 @media (max-width: 1023px) {
   .page-head,
   .section-headline {
     flex-direction: column;
+  }
+
+  .table-pagination {
+    justify-content: flex-start;
   }
 
   .detail-grid {

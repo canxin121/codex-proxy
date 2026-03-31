@@ -5,6 +5,7 @@ use crate::entities::credential_limit;
 use crate::entities::request_record;
 use chrono::DateTime;
 use chrono::Utc;
+use codex_login::AuthDotJson;
 use sea_orm::FromQueryResult;
 use serde::Deserialize;
 use serde::Serialize;
@@ -116,6 +117,15 @@ pub struct AdminLoginResponse {
 #[derive(Debug, Deserialize, Default)]
 pub struct CreateCredentialRequest {}
 
+pub type ExportCredentialJsonResponse = AuthDotJson;
+pub type ImportCredentialJsonRequest = AuthDotJson;
+
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+pub struct PaginationQuery {
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct UpdateCredentialRequest {
     #[serde(rename = "credential_name")]
@@ -150,6 +160,7 @@ pub struct StartDeviceCodeAuthRequest {
 #[derive(Debug, Deserialize, Default)]
 pub struct ListRequestRecordsQuery {
     pub limit: Option<u64>,
+    pub offset: Option<u64>,
     #[serde(rename = "credential_id")]
     pub credential_id: Option<String>,
     #[serde(rename = "api_key_id")]
@@ -167,6 +178,14 @@ pub struct UsageStatsQuery {
     #[serde(rename = "only_failures")]
     pub only_failures: Option<bool>,
     pub top: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct PaginatedResponse<T> {
+    pub items: Vec<T>,
+    pub total: u64,
+    pub limit: u64,
+    pub offset: u64,
 }
 
 #[derive(Debug, Serialize)]

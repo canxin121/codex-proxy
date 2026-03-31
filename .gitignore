@@ -1,5 +1,6 @@
 /target
 /.codex-proxy
 /.env
+/temp
 /ui/node_modules
 /ui/dist

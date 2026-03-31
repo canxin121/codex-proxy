@@ -8,7 +8,6 @@ import {
   MenuOutline,
   PulseOutline,
   SettingsOutline,
-  ShieldCheckmarkOutline,
   LogOutOutline,
 } from '@vicons/ionicons5'
 import {
@@ -94,7 +93,6 @@ const themeOverrides = {
 const menuOptions = computed<MenuOption[]>(() => [
   makeMenuOption('overview', '总览', BarChartOutline),
   makeMenuOption('credentials', '凭证', FolderOpenOutline),
-  makeMenuOption('auth-sessions', 'Auth 会话', ShieldCheckmarkOutline),
   makeMenuOption('api-keys', 'API Keys', KeyOutline),
   makeMenuOption('requests', '请求记录', PulseOutline),
 ])

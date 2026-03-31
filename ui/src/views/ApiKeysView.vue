@@ -12,6 +12,7 @@ import {
   NIcon,
   NInput,
   NModal,
+  NPagination,
   NSkeleton,
   NSpace,
   NSwitch,
@@ -43,8 +44,11 @@ const dialog = useDialog()
 const loading = ref(false)
 const errorMessage = ref('')
 const apiKeys = ref<ApiKeyView[]>([])
+const totalApiKeys = ref(0)
 const searchKeyword = ref('')
 const adminOnly = ref(false)
+const page = ref(1)
+const pageSize = ref(20)
 const showFormModal = ref(false)
 const showSecretModal = ref(false)
 const editingKey = ref<ApiKeyView | null>(null)
@@ -72,11 +76,26 @@ const filteredApiKeys = computed(() => {
 })
 
 const summary = computed(() => ({
-  total: apiKeys.value.length,
+  total: totalApiKeys.value,
+  pageCount: apiKeys.value.length,
   enabled: apiKeys.value.filter((item) => item.is_enabled).length,
   admin: apiKeys.value.filter((item) => item.has_admin_access).length,
   failures: apiKeys.value.reduce((sum, item) => sum + item.request_stats.failure_request_count, 0),
 }))
+
+async function loadApiKeyPage() {
+  const response = await api.listApiKeys(session.apiContext, {
+    limit: pageSize.value,
+    offset: (page.value - 1) * pageSize.value,
+  })
+  const maxPage = Math.max(1, Math.ceil(response.total / pageSize.value))
+  if (page.value > maxPage) {
+    page.value = maxPage
+    return loadApiKeyPage()
+  }
+  apiKeys.value = response.items
+  totalApiKeys.value = response.total
+}
 
 function resetForm() {
   form.api_key_name = ''
@@ -107,12 +126,23 @@ async function load() {
   loading.value = true
   errorMessage.value = ''
   try {
-    apiKeys.value = await api.listApiKeys(session.apiContext)
+    await loadApiKeyPage()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   } finally {
     loading.value = false
   }
+}
+
+function handlePageChange(nextPage: number) {
+  page.value = nextPage
+  void load()
+}
+
+function handlePageSizeChange(nextPageSize: number) {
+  pageSize.value = nextPageSize
+  page.value = 1
+  void load()
 }
 
 async function submitForm() {
@@ -186,7 +216,7 @@ onMounted(() => {
         <div class="page-kicker">Client Keys</div>
         <h1 class="page-title display-font">API Key 分发与使用画像</h1>
         <p class="page-subtitle">
-          用这里生成和管理你自己的 client API key。每个 key 都会累积请求成功失败、token 消耗以及最近一次失败信息。
+          生成和管理客户端 API Key，并查看每个 key 的请求与失败情况。
         </p>
       </div>
       <n-space wrap>
@@ -212,13 +242,13 @@ onMounted(() => {
         <metric-card title="总数" :value="formatNumber(summary.total)" note="已创建的 API key" />
       </n-grid-item>
       <n-grid-item>
-        <metric-card title="启用中" :value="formatNumber(summary.enabled)" note="可直接访问代理" tone="success" />
+        <metric-card title="当前页启用" :value="formatNumber(summary.enabled)" note="当前页可直接访问代理" tone="success" />
       </n-grid-item>
       <n-grid-item>
-        <metric-card title="Admin Scope" :value="formatNumber(summary.admin)" note="具备管理权限的 key" tone="accent" />
+        <metric-card title="当前页 Admin" :value="formatNumber(summary.admin)" note="当前页具备管理权限的 key" tone="accent" />
       </n-grid-item>
       <n-grid-item>
-        <metric-card title="累计失败" :value="formatNumber(summary.failures)" note="来自请求记录聚合" tone="danger" />
+        <metric-card title="当前页失败" :value="formatNumber(summary.failures)" note="来自请求记录聚合" tone="danger" />
       </n-grid-item>
     </n-grid>
 
@@ -236,7 +266,9 @@ onMounted(() => {
             <n-switch v-model:value="adminOnly" />
           </n-space>
         </n-space>
-        <div class="filter-label">当前展示 {{ filteredApiKeys.length }} 个 API key</div>
+        <div class="filter-label">
+          当前页 {{ filteredApiKeys.length }} / {{ summary.pageCount }} · 总计 {{ summary.total }}
+        </div>
       </n-space>
     </n-card>
 
@@ -304,6 +336,20 @@ onMounted(() => {
       </n-card>
     </div>
     <n-empty v-else description="没有匹配到任何 API key" class="empty-state app-shell-card" />
+
+    <n-card class="app-shell-card" :bordered="false">
+      <n-space justify="end">
+        <n-pagination
+          :page="page"
+          :page-size="pageSize"
+          :item-count="summary.total"
+          :page-sizes="[10, 20, 30, 50, 100]"
+          show-size-picker
+          @update:page="handlePageChange"
+          @update:page-size="handlePageSizeChange"
+        />
+      </n-space>
+    </n-card>
 
     <n-modal v-model:show="showFormModal" preset="card" style="width: min(620px, 96vw)" :title="editingKey ? '编辑 API Key' : '新建 API Key'">
       <n-form label-placement="top">

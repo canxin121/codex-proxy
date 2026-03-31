@@ -1,5 +1,6 @@
 use crate::config::AppConfig;
 use crate::entities::api_key;
+use crate::entities::auth_session;
 use crate::entities::credential;
 use crate::entities::credential_limit;
 use crate::error::AppError;
@@ -18,6 +19,7 @@ use rand::RngExt;
 use rand::distr::Alphanumeric;
 use sea_orm::ActiveModelTrait;
 use sea_orm::ColumnTrait;
+use sea_orm::ConnectOptions;
 use sea_orm::ConnectionTrait;
 use sea_orm::Database;
 use sea_orm::DatabaseConnection;
@@ -33,13 +35,16 @@ use sea_orm::sea_query::Table;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use url::form_urlencoded;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -125,13 +130,16 @@ impl AppState {
     pub async fn new(config: AppConfig) -> Result<Self, AppError> {
         std::fs::create_dir_all(&config.data_dir)?;
         std::fs::create_dir_all(config.data_dir.join("credentials"))?;
+        validate_sqlite_database_url(&config.database_url)?;
         ensure_sqlite_database_writable(&config.database_url)?;
 
-        let db = Database::connect(config.database_url.as_str())
+        let db = Database::connect(database_connect_options(&config))
             .await
             .map_err(|err| AppError::internal(err.to_string()))?;
+        ensure_sqlite_connection_writable(&db, &config.database_url).await?;
         initialize_database(&db).await?;
         recover_auth_sessions(&db).await?;
+        retain_latest_auth_session_per_credential(&db).await?;
 
         let http_client = build_reqwest_client();
 
@@ -756,6 +764,93 @@ fn generate_session_token() -> String {
     format!("cps_{suffix}")
 }
 
+fn database_connect_options(config: &AppConfig) -> ConnectOptions {
+    let mut options = ConnectOptions::new(config.database_url.clone());
+    options.sqlx_logging(false);
+    options.connect_timeout(Duration::from_secs(10));
+    options.acquire_timeout(Duration::from_secs(10));
+
+    if is_sqlite_database_url(&config.database_url) {
+        options.max_connections(1);
+        options.min_connections(1);
+        options.idle_timeout(Duration::from_secs(30));
+        // Periodically recycle SQLite connections so the service can recover
+        // from external db-file replacement without a full process restart.
+        options.max_lifetime(Duration::from_secs(60));
+        options.test_before_acquire(true);
+        options.map_sqlx_sqlite_opts(|opts| {
+            opts.read_only(false)
+                .create_if_missing(true)
+                .busy_timeout(Duration::from_secs(5))
+        });
+    }
+
+    options
+}
+
+fn validate_sqlite_database_url(database_url: &str) -> Result<(), AppError> {
+    if !is_sqlite_database_url(database_url) {
+        return Ok(());
+    }
+
+    if let Some(mode) = sqlite_query_value(database_url, "mode")
+        && mode.eq_ignore_ascii_case("ro")
+    {
+        return Err(AppError::internal(
+            "sqlite database URL is configured as read-only (mode=ro). Use mode=rwc for write access.",
+        ));
+    }
+
+    if let Some(immutable) = sqlite_query_value(database_url, "immutable")
+        && matches!(
+            immutable.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    {
+        return Err(AppError::internal(
+            "sqlite database URL sets immutable=1, which is read-only. Remove immutable to allow writes.",
+        ));
+    }
+
+    Ok(())
+}
+
+async fn ensure_sqlite_connection_writable(
+    db: &DatabaseConnection,
+    database_url: &str,
+) -> Result<(), AppError> {
+    if !is_sqlite_database_url(database_url) {
+        return Ok(());
+    }
+
+    db.execute_unprepared("BEGIN IMMEDIATE; ROLLBACK;")
+        .await
+        .map_err(|err| {
+            let message = err.to_string();
+            if sqlite_readonly_error(&message) {
+                AppError::internal(format!(
+                    "sqlite database is not writable: {message}. \
+This often means the db file or its directory became read-only, or the db file was replaced while the process was running."
+                ))
+            } else {
+                AppError::internal(message)
+            }
+        })?;
+
+    Ok(())
+}
+
+fn is_sqlite_database_url(database_url: &str) -> bool {
+    database_url.trim_start().starts_with("sqlite:")
+}
+
+fn sqlite_readonly_error(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("readonly database")
+        || lowered.contains("sqlite_readonly")
+        || lowered.contains("(code: 1032)")
+}
+
 fn ensure_sqlite_database_writable(database_url: &str) -> Result<(), AppError> {
     let Some(database_path) = sqlite_database_path(database_url) else {
         return Ok(());
@@ -809,17 +904,49 @@ fn ensure_directory_writable(path: &Path) -> Result<(), AppError> {
 }
 
 fn sqlite_database_path(database_url: &str) -> Option<PathBuf> {
+    let database_url = database_url.trim();
+    if !is_sqlite_database_url(database_url) {
+        return None;
+    }
     if database_url.starts_with("sqlite::memory:") {
         return None;
     }
-
-    let path = database_url.strip_prefix("sqlite://")?;
-    let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
-    if path.is_empty() || path == ":memory:" {
-        None
-    } else {
-        Some(PathBuf::from(path))
+    if sqlite_query_value(database_url, "mode")
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("memory"))
+    {
+        return None;
     }
+
+    let path = database_url.strip_prefix("sqlite:")?;
+    let path = path.split_once('#').map(|(path, _)| path).unwrap_or(path);
+    let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
+    let path = path.strip_prefix("//").unwrap_or(path);
+    if path.is_empty() || path == ":memory:" {
+        return None;
+    }
+
+    Some(PathBuf::from(path))
+}
+
+fn sqlite_query_value(database_url: &str, key: &str) -> Option<String> {
+    let query = sqlite_url_query(database_url)?;
+    form_urlencoded::parse(query.as_bytes()).find_map(|(name, value)| {
+        if name.eq_ignore_ascii_case(key) {
+            Some(value.into_owned())
+        } else {
+            None
+        }
+    })
+}
+
+fn sqlite_url_query(database_url: &str) -> Option<&str> {
+    let (_, query) = database_url.split_once('?')?;
+    Some(
+        query
+            .split_once('#')
+            .map(|(query, _)| query)
+            .unwrap_or(query),
+    )
 }
 
 fn retain_active_admin_sessions(
@@ -1277,9 +1404,36 @@ async fn recover_auth_sessions(db: &DatabaseConnection) -> Result<(), AppError> 
     Ok(())
 }
 
+async fn retain_latest_auth_session_per_credential(
+    db: &DatabaseConnection,
+) -> Result<(), AppError> {
+    let sessions = auth_session::Entity::find()
+        .order_by_asc(auth_session::Column::CredentialId)
+        .order_by_desc(auth_session::Column::CreatedAt)
+        .all(db)
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
+
+    let mut seen_credentials = HashSet::new();
+    for session in sessions {
+        if seen_credentials.insert(session.credential_id.clone()) {
+            continue;
+        }
+        auth_session::Entity::delete_by_id(session.id)
+            .exec(db)
+            .await
+            .map_err(|err| AppError::internal(err.to_string()))?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::sqlite_database_path;
+    use super::sqlite_query_value;
+    use super::validate_sqlite_database_url;
+    use crate::error::AppError;
     use std::path::PathBuf;
 
     #[test]
@@ -1292,11 +1446,56 @@ mod tests {
             sqlite_database_path("sqlite://relative/codex-proxy.sqlite"),
             Some(PathBuf::from("relative/codex-proxy.sqlite"))
         );
+        assert_eq!(
+            sqlite_database_path("sqlite:relative/codex-proxy.sqlite"),
+            Some(PathBuf::from("relative/codex-proxy.sqlite"))
+        );
+        assert_eq!(
+            sqlite_database_path("sqlite:./relative/codex-proxy.sqlite?cache=shared"),
+            Some(PathBuf::from("./relative/codex-proxy.sqlite"))
+        );
     }
 
     #[test]
     fn sqlite_database_path_ignores_memory_databases() {
         assert_eq!(sqlite_database_path("sqlite::memory:"), None);
         assert_eq!(sqlite_database_path("sqlite://:memory:"), None);
+        assert_eq!(sqlite_database_path("sqlite:file.db?mode=memory"), None);
+    }
+
+    #[test]
+    fn sqlite_query_value_parses_case_insensitive_keys() {
+        assert_eq!(
+            sqlite_query_value("sqlite:///tmp/db.sqlite?mode=rwc&immutable=1", "mode").as_deref(),
+            Some("rwc")
+        );
+        assert_eq!(
+            sqlite_query_value("sqlite:///tmp/db.sqlite?Mode=ro", "mode").as_deref(),
+            Some("ro")
+        );
+    }
+
+    #[test]
+    fn validate_sqlite_database_url_rejects_readonly_flags() {
+        match validate_sqlite_database_url("sqlite:///tmp/db.sqlite?mode=ro") {
+            Err(AppError::Internal(message)) => {
+                assert!(message.contains("read-only"));
+            }
+            other => panic!("expected read-only mode to be rejected, got {other:?}"),
+        }
+
+        match validate_sqlite_database_url("sqlite:///tmp/db.sqlite?immutable=1") {
+            Err(AppError::Internal(message)) => {
+                assert!(message.contains("immutable=1"));
+            }
+            other => panic!("expected immutable=1 to be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_sqlite_database_url_accepts_writable_urls() {
+        assert!(validate_sqlite_database_url("sqlite:///tmp/db.sqlite?mode=rwc").is_ok());
+        assert!(validate_sqlite_database_url("sqlite://relative/db.sqlite").is_ok());
+        assert!(validate_sqlite_database_url("postgres://localhost/db").is_ok());
     }
 }

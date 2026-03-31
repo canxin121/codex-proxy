@@ -24,14 +24,6 @@ const router = createRouter({
       },
     },
     {
-      path: '/auth-sessions',
-      name: 'auth-sessions',
-      component: () => import('@/views/AuthSessionsView.vue'),
-      meta: {
-        label: 'Auth 会话',
-      },
-    },
-    {
       path: '/api-keys',
       name: 'api-keys',
       component: () => import('@/views/ApiKeysView.vue'),

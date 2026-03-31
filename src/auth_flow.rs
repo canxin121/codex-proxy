@@ -125,17 +125,6 @@ pub async fn complete_browser_auth(
         }
     }
 
-    // Mirror Codex's current browser-login persistence behavior: if the legacy
-    // token-exchange endpoint is available, persist the exchanged API key
-    // alongside the ChatGPT tokens. The exchange is best effort upstream.
-    let openai_api_key = exchange_id_token_for_api_key(
-        &config.auth_issuer,
-        &config.auth_client_id,
-        &exchanged.id_token,
-    )
-    .await
-    .ok();
-
     let token_data = TokenData {
         account_id: id_token.chatgpt_account_id.clone(),
         id_token,
@@ -144,7 +133,7 @@ pub async fn complete_browser_auth(
     };
     let auth_payload = AuthDotJson {
         auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key,
+        openai_api_key: None,
         tokens: Some(token_data),
         last_refresh: Some(Utc::now()),
     };
@@ -263,47 +252,6 @@ async fn exchange_code_for_tokens(
         access_token: token_response.access_token,
         refresh_token: token_response.refresh_token,
     })
-}
-
-async fn exchange_id_token_for_api_key(
-    issuer: &str,
-    client_id: &str,
-    id_token: &str,
-) -> Result<String, AppError> {
-    #[derive(serde::Deserialize)]
-    struct TokenExchangeResponse {
-        access_token: String,
-    }
-
-    let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())
-        .map_err(|err| AppError::internal(err.to_string()))?;
-    let response = client
-        .post(format!("{}/oauth/token", issuer.trim_end_matches('/')))
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(format!(
-            "grant_type={}&client_id={}&requested_token={}&subject_token={}&subject_token_type={}",
-            urlencoding::encode("urn:ietf:params:oauth:grant-type:token-exchange"),
-            urlencoding::encode(client_id),
-            urlencoding::encode("openai-api-key"),
-            urlencoding::encode(id_token),
-            urlencoding::encode("urn:ietf:params:oauth:token-type:id_token"),
-        ))
-        .send()
-        .await
-        .map_err(|err| AppError::bad_gateway(err.to_string()))?;
-
-    if !response.status().is_success() {
-        return Err(AppError::bad_gateway(format!(
-            "oauth api key exchange failed with status {}",
-            response.status()
-        )));
-    }
-
-    let token_response = response
-        .json::<TokenExchangeResponse>()
-        .await
-        .map_err(|err| AppError::bad_gateway(err.to_string()))?;
-    Ok(token_response.access_token)
 }
 
 fn callback_error_message(error_code: &str, error_description: Option<&str>) -> String {

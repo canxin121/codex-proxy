@@ -89,14 +89,14 @@ async function load() {
   errorMessage.value = ''
   try {
     const [sessionResponse, credentialResponse] = await Promise.all([
-      api.listAuthSessions(session.apiContext),
-      api.listCredentials(session.apiContext),
+      api.listAuthSessions(session.apiContext, { limit: 1000, offset: 0 }),
+      api.listCredentials(session.apiContext, { limit: 1000, offset: 0 }),
     ])
-    sessions.value = sessionResponse
-    credentials.value = credentialResponse
+    sessions.value = sessionResponse.items
+    credentials.value = credentialResponse.items
     syncPendingBrowserAuthSessions(
-      sessionResponse,
-      new Map(credentialResponse.map((item) => [item.credential_id, item.credential_name])),
+      sessionResponse.items,
+      new Map(credentialResponse.items.map((item) => [item.credential_id, item.credential_name])),
     )
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)

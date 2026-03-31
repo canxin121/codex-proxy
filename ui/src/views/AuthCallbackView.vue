@@ -55,10 +55,6 @@ function backToCredentials() {
   void router.push({ name: 'credentials' })
 }
 
-function backToAuthSessions() {
-  void router.push({ name: 'auth-sessions' })
-}
-
 onMounted(() => {
   void loadSession()
 })
@@ -71,12 +67,11 @@ onMounted(() => {
         <div class="page-kicker">Browser Auth Result</div>
         <h1 class="page-title display-font">Codex 登录回调结果</h1>
         <p class="page-subtitle">
-          OpenAI 已经回跳到当前服务的同域 Browser Auth API，后端也已经完成了 OAuth code 交换和凭证托管。这个页面只负责把最终结果展示给你。
+          展示 Browser Auth 回调结果与后端会话状态。
         </p>
       </div>
       <n-space wrap>
         <n-button secondary @click="copy(resultUrl)">复制结果页地址</n-button>
-        <n-button secondary @click="backToAuthSessions">Auth 会话</n-button>
         <n-button type="primary" @click="backToCredentials">返回凭证页</n-button>
       </n-space>
     </div>

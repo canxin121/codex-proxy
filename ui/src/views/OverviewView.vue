@@ -165,13 +165,13 @@ async function load() {
     const [overviewResponse, usageResponse, credentialResponse, apiKeyResponse] = await Promise.all([
       api.getStatsOverview(session.apiContext),
       api.getUsageStats(session.apiContext, { top: 8 }),
-      api.listCredentials(session.apiContext),
-      api.listApiKeys(session.apiContext),
+      api.listCredentials(session.apiContext, { limit: 1000, offset: 0 }),
+      api.listApiKeys(session.apiContext, { limit: 1000, offset: 0 }),
     ])
     overview.value = overviewResponse
     usage.value = usageResponse
-    credentials.value = credentialResponse
-    apiKeys.value = apiKeyResponse
+    credentials.value = credentialResponse.items
+    apiKeys.value = apiKeyResponse.items
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   } finally {
@@ -197,7 +197,7 @@ onMounted(() => {
         <div class="page-kicker">Proxy Telemetry</div>
         <h1 class="page-title display-font">按时间、凭证、模型展开的全局统计面板</h1>
         <p class="page-subtitle">
-          这里直接对齐 `CLIProxyAPI` 的统计思路，把请求量、token、失败阶段、状态码和热点路径都拉成可读的趋势和分布，而不是只看总数。
+          展示请求量、Token、失败阶段、状态码和热点路径，便于快速定位问题与负载热点。
         </p>
       </div>
       <n-button secondary type="primary" :loading="loading" @click="load">

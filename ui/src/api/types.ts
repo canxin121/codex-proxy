@@ -2,6 +2,18 @@ export interface HealthResponse {
   status: string
 }
 
+export interface PaginatedResponse<T> {
+  items: T[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface PaginationQuery {
+  limit?: number
+  offset?: number
+}
+
 export interface AdminSessionView {
   principal_kind: 'admin_session' | 'api_key'
   api_key_id: string | null
@@ -229,6 +241,10 @@ export interface StatsOverviewView {
 
 export interface CreateCredentialPayload {}
 
+export type ImportCredentialJsonPayload = Record<string, unknown>
+
+export type ExportCredentialJsonResponse = Record<string, unknown>
+
 export interface UpdateCredentialPayload {
   credential_name?: string
   is_enabled?: boolean
@@ -263,6 +279,7 @@ export interface UpdateApiKeyPayload {
 
 export interface RequestQuery {
   limit?: number
+  offset?: number
   credential_id?: string
   api_key_id?: string
   only_failures?: boolean
