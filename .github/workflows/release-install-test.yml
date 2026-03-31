@@ -39,6 +39,7 @@ jobs:
           install_root="$(mktemp -d)"
           bin_dir="${install_root}/bin"
           share_dir="${install_root}/share"
+          log_file="${install_root}/install.log"
 
           echo "Using install root: ${install_root}"
           curl -fsSL "https://raw.githubusercontent.com/${repo}/${tag}/scripts/install.sh" \
@@ -46,9 +47,10 @@ jobs:
               CODEX_PROXY_VERSION="${tag}" \
               CODEX_PROXY_INSTALL_BIN_DIR="${bin_dir}" \
               CODEX_PROXY_INSTALL_SHARE_DIR="${share_dir}/codex-proxy" \
-              bash
+              bash | tee "${log_file}"
 
           "${bin_dir}/codex-proxy" --version >/dev/null 2>&1 || true
+          grep -q "x86_64-unknown-linux-musl" "${log_file}"
 
           echo "install_root=${install_root}" >> "$GITHUB_OUTPUT"
           echo "bin_path=${bin_dir}/codex-proxy" >> "$GITHUB_OUTPUT"
@@ -69,6 +71,29 @@ jobs:
           repo="${{ github.repository }}"
           musl_url="https://github.com/${repo}/releases/download/${tag}/codex-proxy-${tag}-x86_64-unknown-linux-musl.tar.gz"
           curl -fsI "${musl_url}" >/dev/null
+
+      - name: Verify explicit gnu install path works
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.vars.outputs.tag }}"
+          repo="${{ github.repository }}"
+          install_root="$(mktemp -d)"
+          bin_dir="${install_root}/bin"
+          share_dir="${install_root}/share"
+          log_file="${install_root}/install-gnu.log"
+
+          curl -fsSL "https://raw.githubusercontent.com/${repo}/${tag}/scripts/install.sh" \
+            | CODEX_PROXY_REPO="${repo}" \
+              CODEX_PROXY_VERSION="${tag}" \
+              CODEX_PROXY_TARGET="x86_64-unknown-linux-gnu" \
+              CODEX_PROXY_INSTALL_BIN_DIR="${bin_dir}" \
+              CODEX_PROXY_INSTALL_SHARE_DIR="${share_dir}/codex-proxy" \
+              bash | tee "${log_file}"
+
+          grep -q "x86_64-unknown-linux-gnu" "${log_file}"
+          test -x "${bin_dir}/codex-proxy"
+          test -f "${share_dir}/codex-proxy/ui/dist/index.html"
 
       - name: Smoke run service
         shell: bash
@@ -103,6 +128,6 @@ jobs:
             sleep 0.5
           done
 
-          curl -fsS "http://127.0.0.1:${port}/healthz" | grep -q "ok"
-          curl -fsS "http://127.0.0.1:${port}/readyz" | grep -q "ok"
+          curl -fsS "http://127.0.0.1:${port}/healthz" >/dev/null
+          curl -fsS "http://127.0.0.1:${port}/readyz" >/dev/null
           curl -fsS "http://127.0.0.1:${port}/" | grep -qi "<html"
