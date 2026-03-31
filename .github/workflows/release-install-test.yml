@@ -1,0 +1,108 @@
+name: Release Install Test
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to test (example: v0.1.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  install-linux:
+    name: Install and smoke test on Linux (musl first)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Resolve tag
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install from tagged script
+        id: install
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.vars.outputs.tag }}"
+          repo="${{ github.repository }}"
+          install_root="$(mktemp -d)"
+          bin_dir="${install_root}/bin"
+          share_dir="${install_root}/share"
+
+          echo "Using install root: ${install_root}"
+          curl -fsSL "https://raw.githubusercontent.com/${repo}/${tag}/scripts/install.sh" \
+            | CODEX_PROXY_REPO="${repo}" \
+              CODEX_PROXY_VERSION="${tag}" \
+              CODEX_PROXY_INSTALL_BIN_DIR="${bin_dir}" \
+              CODEX_PROXY_INSTALL_SHARE_DIR="${share_dir}/codex-proxy" \
+              bash
+
+          "${bin_dir}/codex-proxy" --version >/dev/null 2>&1 || true
+
+          echo "install_root=${install_root}" >> "$GITHUB_OUTPUT"
+          echo "bin_path=${bin_dir}/codex-proxy" >> "$GITHUB_OUTPUT"
+          echo "ui_dist=${share_dir}/codex-proxy/ui/dist" >> "$GITHUB_OUTPUT"
+
+      - name: Verify installed files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "${{ steps.install.outputs.bin_path }}"
+          test -f "${{ steps.install.outputs.ui_dist }}/index.html"
+
+      - name: Verify release has musl artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.vars.outputs.tag }}"
+          repo="${{ github.repository }}"
+          musl_url="https://github.com/${repo}/releases/download/${tag}/codex-proxy-${tag}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsI "${musl_url}" >/dev/null
+
+      - name: Smoke run service
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="${{ steps.install.outputs.bin_path }}"
+          ui_dist="${{ steps.install.outputs.ui_dist }}"
+          data_dir="$(mktemp -d)"
+          port=18787
+
+          CODEX_PROXY_UI_DIST_DIR="${ui_dist}" \
+          "${bin}" \
+            --bind "127.0.0.1:${port}" \
+            --data-dir "${data_dir}" \
+            --admin-password "test-admin-password" \
+            --admin-key "test-admin-key" \
+            >"${data_dir}/server.log" 2>&1 &
+          pid=$!
+
+          cleanup() {
+            if kill -0 "$pid" >/dev/null 2>&1; then
+              kill "$pid" >/dev/null 2>&1 || true
+              wait "$pid" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+
+          for _ in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:${port}/healthz" >/dev/null; then
+              break
+            fi
+            sleep 0.5
+          done
+
+          curl -fsS "http://127.0.0.1:${port}/healthz" | grep -q "ok"
+          curl -fsS "http://127.0.0.1:${port}/readyz" | grep -q "ok"
+          curl -fsS "http://127.0.0.1:${port}/" | grep -qi "<html"

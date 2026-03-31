@@ -176,6 +176,11 @@ This repo includes GitHub Actions workflows for CI and Release:
   - also supports manual `workflow_dispatch` with a `tag` input
   - publishes platform archives as GitHub Release assets
   - publishes both Linux musl and Linux gnu artifacts, with musl as the primary distribution target
+- Post-release install verification: `.github/workflows/release-install-test.yml`
+  - triggers on `release.published` (and manual `workflow_dispatch`)
+  - downloads installer script from the exact release tag
+  - runs real install against GitHub Release assets
+  - verifies installed binary + UI files and performs runtime smoke checks (`/healthz`, `/readyz`, `/`)
 
 Create a release by tagging and pushing:
 
