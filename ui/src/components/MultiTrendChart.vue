@@ -21,7 +21,7 @@ const props = defineProps<{
 }>()
 
 const viewBoxWidth = 920
-const viewBoxHeight = 300
+const viewBoxHeight = 260
 const chartLeft = 62
 const chartRight = 22
 const chartTop = 26
@@ -34,6 +34,9 @@ const hoveredIndex = ref<number | null>(null)
 const activeSeries = computed(() => props.series.filter((item) => item.points.length > 0))
 const labels = computed(() => activeSeries.value[0]?.points.map((item) => item.label) ?? [])
 const pointCount = computed(() => labels.value.length)
+const axisUsesCompactFormat = computed(
+  () => activeSeries.value.length > 0 && activeSeries.value.every((series) => Boolean(series.compact)),
+)
 
 const maxValue = computed(() =>
   Math.max(
@@ -249,6 +252,10 @@ function formatValue(value: number, compact = false) {
   return compact ? formatTokenCompact(value) : formatNumber(value)
 }
 
+function formatAxisValue(value: number) {
+  return axisUsesCompactFormat.value ? formatTokenCompact(value) : formatNumber(value)
+}
+
 function setHoveredIndex(index: number | null) {
   hoveredIndex.value = index
 }
@@ -289,7 +296,7 @@ function setHoveredIndex(index: number | null) {
               text-anchor="end"
               class="chart-grid__label"
             >
-              {{ formatTokenCompact(Math.max(0, line.value)) }}
+              {{ formatAxisValue(Math.max(0, line.value)) }}
             </text>
           </g>
         </g>
@@ -387,7 +394,7 @@ function setHoveredIndex(index: number | null) {
 
 .chart-empty {
   display: grid;
-  min-height: 240px;
+  min-height: 208px;
   place-items: center;
   color: var(--cp-text-soft);
   border: 1px dashed var(--cp-border);
@@ -435,7 +442,7 @@ function setHoveredIndex(index: number | null) {
 .chart-svg {
   width: 100%;
   height: auto;
-  aspect-ratio: 920 / 300;
+  aspect-ratio: 920 / 260;
   display: block;
   overflow: visible;
 }

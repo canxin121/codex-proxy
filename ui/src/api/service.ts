@@ -1,11 +1,14 @@
 import { apiRequest, type ApiContext } from '@/api/client'
 import type {
+  AdminKeyView,
   AdminLoginPayload,
   AdminLoginResponse,
   AdminSessionView,
   ApiKeyView,
   AuthSessionView,
   CompleteBrowserAuthPayload,
+  CreateAdminKeyPayload,
+  CreateAdminKeyResponse,
   CreateApiKeyPayload,
   CreateApiKeyResponse,
   CreateCredentialPayload,
@@ -20,6 +23,7 @@ import type {
   StartBrowserAuthPayload,
   StartDeviceCodeAuthPayload,
   StatsOverviewView,
+  UpdateAdminKeyPayload,
   UpdateApiKeyPayload,
   UpdateCredentialPayload,
   UsageQuery,
@@ -42,6 +46,34 @@ export const api = {
   logoutAdminSession(context: ApiContext) {
     return apiRequest<void>(context, '/admin/session/logout', {
       method: 'POST',
+    })
+  },
+  listAdminKeys(context: ApiContext, query: PaginationQuery = {}) {
+    return apiRequest<PaginatedResponse<AdminKeyView>>(
+      context,
+      '/admin/admin-keys',
+      {},
+      query as Record<string, string | number | boolean | undefined>,
+    )
+  },
+  getAdminKey(context: ApiContext, adminKeyId: string) {
+    return apiRequest<AdminKeyView>(context, `/admin/admin-keys/${adminKeyId}`)
+  },
+  createAdminKey(context: ApiContext, payload: CreateAdminKeyPayload) {
+    return apiRequest<CreateAdminKeyResponse>(context, '/admin/admin-keys', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  updateAdminKey(context: ApiContext, adminKeyId: string, payload: UpdateAdminKeyPayload) {
+    return apiRequest<AdminKeyView>(context, `/admin/admin-keys/${adminKeyId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    })
+  },
+  deleteAdminKey(context: ApiContext, adminKeyId: string) {
+    return apiRequest<void>(context, `/admin/admin-keys/${adminKeyId}`, {
+      method: 'DELETE',
     })
   },
   listCredentials(context: ApiContext, query: PaginationQuery = {}) {

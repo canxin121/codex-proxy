@@ -1,9 +1,11 @@
 use crate::auth_flow;
+use crate::entities::admin_key;
 use crate::entities::api_key;
 use crate::entities::auth_session;
 use crate::entities::credential;
 use crate::entities::credential_limit;
 use crate::error::AppError;
+use crate::models::AdminKeyView;
 use crate::models::AdminLoginRequest;
 use crate::models::AdminLoginResponse;
 use crate::models::AdminSessionView;
@@ -12,6 +14,8 @@ use crate::models::AuthMethod;
 use crate::models::AuthSessionView;
 use crate::models::AuthStatus;
 use crate::models::CompleteBrowserAuthRequest;
+use crate::models::CreateAdminKeyRequest;
+use crate::models::CreateAdminKeyResponse;
 use crate::models::CreateApiKeyRequest;
 use crate::models::CreateApiKeyResponse;
 use crate::models::CreateCredentialRequest;
@@ -26,6 +30,7 @@ use crate::models::RequestRecordView;
 use crate::models::StartBrowserAuthRequest;
 use crate::models::StartDeviceCodeAuthRequest;
 use crate::models::StatsOverviewView;
+use crate::models::UpdateAdminKeyRequest;
 use crate::models::UpdateApiKeyRequest;
 use crate::models::UpdateCredentialRequest;
 use crate::models::UsageStatsQuery;
@@ -48,6 +53,7 @@ use crate::request_stats::usage_stats as query_usage_stats;
 use crate::state::AppState;
 use crate::state::AuthenticatedPrincipal;
 use crate::state::AuthenticatedPrincipalKind;
+use crate::state::BOOTSTRAP_ADMIN_KEY_ID;
 use crate::state::RequestLease;
 use crate::state::credential_view_material;
 use axum::Json;
@@ -197,6 +203,16 @@ pub fn build_router(state: AppState) -> Router {
             post(complete_browser_auth_session),
         )
         .route("/admin/auth/device-code", post(start_device_code_auth))
+        .route(
+            "/admin/admin-keys",
+            get(list_admin_keys).post(create_admin_key),
+        )
+        .route(
+            "/admin/admin-keys/{id}",
+            get(get_admin_key)
+                .patch(update_admin_key)
+                .delete(delete_admin_key),
+        )
         .route("/admin/api-keys", get(list_api_keys).post(create_api_key))
         .route(
             "/admin/api-keys/{id}",
@@ -247,13 +263,17 @@ async fn login_admin_session(
     Ok(Json(AdminLoginResponse {
         session_token: created.session_token,
         session: AdminSessionView {
-            principal_kind: "admin_session".to_string(),
-            api_key_id: None,
-            api_key_name: None,
+            principal_kind: AuthenticatedPrincipalKind::AdminSession
+                .as_str()
+                .to_string(),
+            admin_key_id: None,
+            admin_key_name: None,
             console_refresh_interval_seconds: CONSOLE_REFRESH_INTERVAL_SECONDS,
-            created_at: Some(created.created_at),
-            last_used_at: Some(created.last_used_at),
-            expires_at: Some(created.expires_at),
+            admin_session_created_at: Some(created.created_at),
+            admin_session_last_used_at: Some(created.last_used_at),
+            admin_session_expires_at: Some(created.expires_at),
+            admin_key_last_used_at: None,
+            admin_key_expires_at: None,
         },
     }))
 }
@@ -821,6 +841,127 @@ async fn cancel_auth_session(
     Ok(Json(auth_session_to_view(updated)?))
 }
 
+async fn list_admin_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PaginationQuery>,
+) -> Result<Json<PaginatedResponse<AdminKeyView>>, AppError> {
+    require_admin(&state, &headers).await?;
+    let (limit, offset) = normalize_pagination(&query, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+    let base_query = admin_key::Entity::find().order_by_asc(admin_key::Column::CreatedAt);
+    let total = base_query
+        .clone()
+        .count(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
+    let models = base_query
+        .offset(offset)
+        .limit(limit)
+        .all(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
+    let items = models
+        .into_iter()
+        .map(admin_key_to_view)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(PaginatedResponse {
+        items,
+        total,
+        limit,
+        offset,
+    }))
+}
+
+async fn get_admin_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<AdminKeyView>, AppError> {
+    require_admin(&state, &headers).await?;
+    let model = find_admin_key(&state, &id).await?;
+    Ok(Json(admin_key_to_view(model)?))
+}
+
+async fn create_admin_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateAdminKeyRequest>,
+) -> Result<(StatusCode, Json<CreateAdminKeyResponse>), AppError> {
+    require_admin(&state, &headers).await?;
+    let plain_text = generate_admin_key();
+    let now = Utc::now();
+    let model = admin_key::ActiveModel {
+        id: Set(Uuid::new_v4().to_string()),
+        name: Set(payload.name),
+        key_hash: Set(crate::state::hash_api_key(&plain_text)),
+        enabled: Set(true),
+        expires_at: Set(payload.expires_at),
+        last_used_at: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    };
+    let inserted = model
+        .insert(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateAdminKeyResponse {
+            admin_key_value: plain_text,
+            admin_key_record: admin_key_to_view(inserted)?,
+        }),
+    ))
+}
+
+async fn update_admin_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdateAdminKeyRequest>,
+) -> Result<Json<AdminKeyView>, AppError> {
+    require_admin(&state, &headers).await?;
+    let existing = find_admin_key(&state, &id).await?;
+    if existing.id == BOOTSTRAP_ADMIN_KEY_ID {
+        return Err(AppError::forbidden(
+            "bootstrap admin key cannot be modified",
+        ));
+    }
+    if let Some(enabled) = payload.enabled
+        && !enabled
+        && existing.enabled
+    {
+        let enabled_count = admin_key::Entity::find()
+            .filter(admin_key::Column::Enabled.eq(true))
+            .count(state.db())
+            .await
+            .map_err(|err| AppError::internal(err.to_string()))?;
+        if enabled_count <= 1 {
+            return Err(AppError::forbidden(
+                "at least one enabled admin key is required",
+            ));
+        }
+    }
+
+    let mut active = admin_key::ActiveModel::from(existing);
+    if let Some(name) = payload.name {
+        active.name = Set(name);
+    }
+    if let Some(enabled) = payload.enabled {
+        active.enabled = Set(enabled);
+    }
+    if let Some(expires_at) = payload.expires_at {
+        active.expires_at = Set(Some(expires_at));
+    }
+    active.updated_at = Set(Utc::now());
+
+    let updated = active
+        .update(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
+    Ok(Json(admin_key_to_view(updated)?))
+}
+
 async fn list_api_keys(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -875,7 +1016,6 @@ async fn create_api_key(
         name: Set(payload.name),
         key_hash: Set(crate::state::hash_api_key(&plain_text)),
         enabled: Set(true),
-        is_admin: Set(payload.is_admin.unwrap_or(false)),
         expires_at: Set(payload.expires_at),
         last_used_at: Set(None),
         created_at: Set(now),
@@ -945,6 +1085,36 @@ async fn get_usage_stats(
 ) -> Result<Json<UsageStatsView>, AppError> {
     require_admin(&state, &headers).await?;
     Ok(Json(query_usage_stats(&state, &query).await?))
+}
+
+async fn delete_admin_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, AppError> {
+    require_admin(&state, &headers).await?;
+    let existing = find_admin_key(&state, &id).await?;
+    if existing.id == BOOTSTRAP_ADMIN_KEY_ID {
+        return Err(AppError::forbidden("bootstrap admin key cannot be deleted"));
+    }
+    if existing.enabled {
+        let enabled_count = admin_key::Entity::find()
+            .filter(admin_key::Column::Enabled.eq(true))
+            .count(state.db())
+            .await
+            .map_err(|err| AppError::internal(err.to_string()))?;
+        if enabled_count <= 1 {
+            return Err(AppError::forbidden(
+                "at least one enabled admin key is required",
+            ));
+        }
+    }
+
+    admin_key::Entity::delete_by_id(id)
+        .exec(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_api_key(
@@ -2323,12 +2493,14 @@ fn extract_bearer(headers: &HeaderMap) -> Result<String, AppError> {
 fn admin_session_view(principal: &AuthenticatedPrincipal) -> AdminSessionView {
     AdminSessionView {
         principal_kind: principal.principal_kind.as_str().to_string(),
-        api_key_id: principal.api_key_id.clone(),
-        api_key_name: principal.api_key_name.clone(),
+        admin_key_id: principal.admin_key_id.clone(),
+        admin_key_name: principal.admin_key_name.clone(),
         console_refresh_interval_seconds: CONSOLE_REFRESH_INTERVAL_SECONDS,
-        created_at: principal.admin_session_created_at,
-        last_used_at: principal.admin_session_last_used_at,
-        expires_at: principal.admin_session_expires_at,
+        admin_session_created_at: principal.admin_session_created_at,
+        admin_session_last_used_at: principal.admin_session_last_used_at,
+        admin_session_expires_at: principal.admin_session_expires_at,
+        admin_key_last_used_at: principal.admin_key_last_used_at,
+        admin_key_expires_at: principal.admin_key_expires_at,
     }
 }
 
@@ -2363,6 +2535,13 @@ async fn api_key_to_view(state: &AppState, model: api_key::Model) -> Result<ApiK
     ))
 }
 
+fn admin_key_to_view(model: admin_key::Model) -> Result<AdminKeyView, AppError> {
+    Ok(AdminKeyView::from_model(
+        model.clone(),
+        model.id == BOOTSTRAP_ADMIN_KEY_ID,
+    ))
+}
+
 fn normalize_pagination(query: &PaginationQuery, default_limit: u64, max_limit: u64) -> (u64, u64) {
     let limit = query
         .limit
@@ -2391,6 +2570,14 @@ async fn find_auth_session(state: &AppState, id: &str) -> Result<auth_session::M
         .await
         .map_err(|err| AppError::internal(err.to_string()))?
         .ok_or_else(|| AppError::not_found("auth session not found"))
+}
+
+async fn find_admin_key(state: &AppState, id: &str) -> Result<admin_key::Model, AppError> {
+    admin_key::Entity::find_by_id(id.to_string())
+        .one(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?
+        .ok_or_else(|| AppError::not_found("admin key not found"))
 }
 
 async fn find_api_key(state: &AppState, id: &str) -> Result<api_key::Model, AppError> {
@@ -2778,6 +2965,15 @@ fn generate_proxy_api_key() -> String {
         .map(char::from)
         .collect::<String>();
     format!("cpk_{suffix}")
+}
+
+fn generate_admin_key() -> String {
+    let suffix = rand::rng()
+        .sample_iter(Alphanumeric)
+        .take(40)
+        .map(char::from)
+        .collect::<String>();
+    format!("cak_{suffix}")
 }
 
 fn build_client_response(
@@ -3200,6 +3396,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/codex-proxy"),
             database_url: "sqlite::memory:".to_string(),
             admin_password_hash: "hash".to_string(),
+            admin_key_hash: "hash".to_string(),
             chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             auth_issuer: "https://auth.openai.com".to_string(),
             auth_client_id: "client".to_string(),

@@ -163,7 +163,7 @@ function openEditModal(item: CredentialView) {
 }
 
 async function load() {
-  if (!session.hasAdminSession) {
+  if (!session.hasAdminKey) {
     return
   }
   loading.value = true
@@ -450,7 +450,7 @@ async function copy(value: string, successText = '已复制') {
 
 useAutoRefresh(
   load,
-  computed(() => session.hasAdminSession),
+  computed(() => session.hasAdminKey),
   computed(() => session.refreshIntervalSeconds * 1000),
 )
 
@@ -464,9 +464,9 @@ onMounted(() => {
     <div class="page-head">
       <div>
         <div class="page-kicker">Credential Pool</div>
-        <h1 class="page-title display-font">凭证池、限额和认证入口</h1>
+        <h1 class="page-title display-font">凭证管理</h1>
         <p class="page-subtitle">
-          管理 ChatGPT Auth 凭证，支持 Browser Auth、Device Code 和 JSON 导入。
+          导入、认证并管理凭证。
         </p>
       </div>
       <n-space wrap>

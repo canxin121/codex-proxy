@@ -36,7 +36,7 @@ async function copy(value: string) {
 }
 
 async function loadSession() {
-  if (!session.hasAdminSession || !authSessionId.value) {
+  if (!session.hasAdminKey || !authSessionId.value) {
     matchedSession.value = null
     return
   }
@@ -65,9 +65,9 @@ onMounted(() => {
     <div class="page-head">
       <div>
         <div class="page-kicker">Browser Auth Result</div>
-        <h1 class="page-title display-font">Codex 登录回调结果</h1>
+        <h1 class="page-title display-font">登录回调</h1>
         <p class="page-subtitle">
-          展示 Browser Auth 回调结果与后端会话状态。
+          查看 Browser Auth 回调结果与会话状态。
         </p>
       </div>
       <n-space wrap>

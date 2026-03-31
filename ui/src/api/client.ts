@@ -1,6 +1,6 @@
 export interface ApiContext {
   baseUrl: string
-  adminSessionToken: string
+  adminKey: string
 }
 
 export class ApiError extends Error {
@@ -37,8 +37,8 @@ export async function apiRequest<T>(
   query?: Record<string, string | number | boolean | undefined>,
 ): Promise<T> {
   const headers = new Headers(init.headers ?? {})
-  if (context.adminSessionToken.trim()) {
-    headers.set('Authorization', `Bearer ${context.adminSessionToken}`)
+  if (context.adminKey.trim()) {
+    headers.set('Authorization', `Bearer ${context.adminKey}`)
   }
   if (init.body && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')

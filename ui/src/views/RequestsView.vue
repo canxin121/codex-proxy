@@ -26,7 +26,7 @@ import { api } from '@/api/service'
 import type { ApiKeyView, CredentialView, RequestBreakdownView, RequestRecordView, UsageStatsView } from '@/api/types'
 import { useSessionStore } from '@/stores/session'
 import { useAutoRefresh } from '@/composables/use-auto-refresh'
-import { formatDateTime, formatDurationMs, formatNumber, formatPercent } from '@/utils/format'
+import { formatDateTime, formatDurationMs, formatNumber, formatPercent, formatTokenCompact } from '@/utils/format'
 
 type BreakdownListItem = RequestBreakdownView & {
   description?: string
@@ -186,20 +186,6 @@ const dailyTokenTrendSeries = computed(() => {
   ]
 })
 
-const topModels = computed<BreakdownListItem[]>(() =>
-  (usage.value?.models ?? []).slice(0, 6).map((item) => ({
-    ...item,
-    description: `输入 ${formatNumber(item.token_usage.read_input_tokens)} · 输出 ${formatNumber(item.token_usage.write_output_tokens)}`,
-  })),
-)
-
-const topPaths = computed<BreakdownListItem[]>(() =>
-  (usage.value?.paths ?? []).slice(0, 6).map((item) => ({
-    ...item,
-    description: `总 tokens ${formatNumber(item.token_usage.all_tokens)} · 失败 ${formatNumber(item.failure_request_count)}`,
-  })),
-)
-
 const statusCodes = computed<BreakdownListItem[]>(() =>
   (usage.value?.status_codes ?? []).slice(0, 6).map((item) => ({
     ...item,
@@ -215,7 +201,7 @@ const errorPhases = computed<BreakdownListItem[]>(() =>
 )
 
 async function load() {
-  if (!session.hasAdminSession) {
+  if (!session.hasAdminKey) {
     return
   }
   loading.value = true
@@ -276,7 +262,7 @@ function handlePageSizeChange(nextPageSize: number) {
 
 useAutoRefresh(
   load,
-  computed(() => session.hasAdminSession),
+  computed(() => session.hasAdminKey),
   computed(() => session.refreshIntervalSeconds * 1000),
 )
 
@@ -290,9 +276,9 @@ onMounted(() => {
     <div class="page-head">
       <div>
         <div class="page-kicker">Request Journal</div>
-        <h1 class="page-title display-font">当前筛选范围的统计剖面 + 逐请求明细</h1>
+        <h1 class="page-title display-font">请求明细</h1>
         <p class="page-subtitle">
-          按筛选条件查看聚合统计和逐请求明细。
+          按条件筛选并查看请求统计与记录。
         </p>
       </div>
       <n-button secondary type="primary" :loading="loading" @click="load">
@@ -377,56 +363,43 @@ onMounted(() => {
               </div>
             </div>
             <n-tag round type="info">
-              总量 {{ formatNumber(usage.summary.token_usage.all_tokens) }}
+              总量 {{ formatTokenCompact(usage.summary.token_usage.all_tokens) }}
             </n-tag>
           </div>
         </template>
         <token-usage-strip :usage="usage.summary.token_usage" />
       </n-card>
 
-      <n-card class="section-card app-shell-card" :bordered="false">
-        <template #header>
-          <div class="section-headline">
-            <div>
-              <div class="section-title">按天请求趋势</div>
-              <div class="section-note">当前筛选范围最近 14 天，合并展示总请求、成功、失败</div>
-            </div>
-          </div>
-        </template>
-        <multi-trend-chart :series="dailyRequestTrendSeries" />
-      </n-card>
-
-      <n-card class="section-card app-shell-card" :bordered="false">
-        <template #header>
-          <div class="section-headline">
-            <div>
-              <div class="section-title">按天 Token 趋势</div>
-              <div class="section-note">当前筛选范围最近 14 天，合并展示输入、缓存、输出、思考与总量</div>
-            </div>
-          </div>
-        </template>
-        <multi-trend-chart :series="dailyTokenTrendSeries" />
-      </n-card>
+      <n-grid cols="1 m:2" responsive="screen" :x-gap="18" :y-gap="18">
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false">
+            <template #header>
+              <div class="section-headline">
+                <div>
+                  <div class="section-title">按天请求趋势</div>
+                  <div class="section-note">当前筛选范围最近 14 天，合并展示总请求、成功、失败</div>
+                </div>
+              </div>
+            </template>
+            <multi-trend-chart :series="dailyRequestTrendSeries" />
+          </n-card>
+        </n-grid-item>
+        <n-grid-item>
+          <n-card class="section-card app-shell-card" :bordered="false">
+            <template #header>
+              <div class="section-headline">
+                <div>
+                  <div class="section-title">按天 Token 趋势</div>
+                  <div class="section-note">当前筛选范围最近 14 天，合并展示输入、缓存、输出、思考与总量</div>
+                </div>
+              </div>
+            </template>
+            <multi-trend-chart :series="dailyTokenTrendSeries" />
+          </n-card>
+        </n-grid-item>
+      </n-grid>
 
       <n-grid cols="1 xl:2" responsive="screen" :x-gap="18" :y-gap="18">
-        <n-grid-item>
-          <n-card class="section-card app-shell-card" :bordered="false" title="最热模型">
-            <breakdown-list
-              :items="topModels"
-              :total-requests="usage.summary.total_request_count"
-              empty-text="当前筛选范围没有模型数据"
-            />
-          </n-card>
-        </n-grid-item>
-        <n-grid-item>
-          <n-card class="section-card app-shell-card" :bordered="false" title="最忙路径">
-            <breakdown-list
-              :items="topPaths"
-              :total-requests="usage.summary.total_request_count"
-              empty-text="当前筛选范围没有路径数据"
-            />
-          </n-card>
-        </n-grid-item>
         <n-grid-item>
           <n-card class="section-card app-shell-card" :bordered="false" title="状态码分布">
             <breakdown-list
@@ -513,11 +486,11 @@ onMounted(() => {
                 <div class="cell-meta">{{ item.error_message ?? '无错误消息' }}</div>
               </td>
               <td>
-                <div class="cell-meta">总量 {{ formatNumber(item.token_usage.all_tokens) }}</div>
-                <div class="cell-meta">输入 {{ formatNumber(item.token_usage.read_input_tokens) }}</div>
-                <div class="cell-meta">缓存 {{ formatNumber(item.token_usage.cache_read_input_tokens) }}</div>
-                <div class="cell-meta">输出 {{ formatNumber(item.token_usage.write_output_tokens) }}</div>
-                <div class="cell-meta">推理 {{ formatNumber(item.token_usage.write_reasoning_tokens) }}</div>
+                <div class="cell-meta">总量 {{ formatTokenCompact(item.token_usage.all_tokens) }}</div>
+                <div class="cell-meta">输入 {{ formatTokenCompact(item.token_usage.read_input_tokens) }}</div>
+                <div class="cell-meta">缓存 {{ formatTokenCompact(item.token_usage.cache_read_input_tokens) }}</div>
+                <div class="cell-meta">输出 {{ formatTokenCompact(item.token_usage.write_output_tokens) }}</div>
+                <div class="cell-meta">推理 {{ formatTokenCompact(item.token_usage.write_reasoning_tokens) }}</div>
               </td>
               <td>
                 <n-button tertiary size="small" @click="selectedRecord = item">

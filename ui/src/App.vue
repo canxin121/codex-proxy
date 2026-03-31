@@ -4,6 +4,7 @@ import { RouterLink, useRoute, useRouter } from 'vue-router'
 import {
   BarChartOutline,
   FolderOpenOutline,
+  ShieldCheckmarkOutline,
   KeyOutline,
   MenuOutline,
   PulseOutline,
@@ -55,7 +56,7 @@ const settingsForm = reactive({
 })
 
 watch(
-  () => [session.baseUrl, session.adminSessionToken] as const,
+  () => [session.baseUrl, session.adminKey] as const,
   ([baseUrl]) => {
     settingsForm.baseUrl = baseUrl
   },
@@ -87,6 +88,7 @@ const themeOverrides = {
 const menuOptions = computed<MenuOption[]>(() => [
   makeMenuOption('overview', '总览', BarChartOutline),
   makeMenuOption('credentials', '凭证', FolderOpenOutline),
+  makeMenuOption('admin-keys', 'Admin Keys', ShieldCheckmarkOutline),
   makeMenuOption('api-keys', 'API Keys', KeyOutline),
   makeMenuOption('requests', '请求记录', PulseOutline),
 ])
@@ -123,7 +125,7 @@ async function handleLogin(payload: {
     const response = await api.loginAdminSession(
       {
         baseUrl,
-        adminSessionToken: '',
+        adminKey: '',
       },
       {
         admin_password: payload.adminPassword,
@@ -131,14 +133,14 @@ async function handleLogin(payload: {
     )
     session.updateSession({
       baseUrl,
-      adminSessionToken: response.admin_session_token,
+      adminKey: response.admin_session_token,
       refreshIntervalSeconds: response.admin_session.console_refresh_interval_seconds,
     })
     await verifyAdminSession()
   } catch (error) {
     session.updateSession({
       baseUrl: payload.baseUrl.trim(),
-      adminSessionToken: '',
+      adminKey: '',
     })
     serviceHealthy.value = null
     loginError.value = error instanceof ApiError ? error.message : String(error)
@@ -152,7 +154,7 @@ function applySettings() {
   const baseUrlChanged = nextBaseUrl !== session.baseUrl.trim()
   session.updateSession({
     baseUrl: nextBaseUrl,
-    adminSessionToken: baseUrlChanged ? '' : session.adminSessionToken,
+    adminKey: baseUrlChanged ? '' : session.adminKey,
   })
   if (baseUrlChanged) {
     serviceHealthy.value = null
@@ -164,9 +166,9 @@ function applySettings() {
 }
 
 async function verifyAdminSession() {
-  if (!session.hasAdminSession) {
+  if (!session.hasAdminKey) {
     serviceHealthy.value = null
-    return
+    return false
   }
   try {
     const response = await api.getAdminSession(session.apiContext)
@@ -176,17 +178,24 @@ async function verifyAdminSession() {
     serviceHealthy.value = true
     lastHealthError.value = ''
     loginError.value = ''
+    return true
   } catch (error) {
     const message = error instanceof ApiError ? error.message : String(error)
     if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
-      session.clearAdminSession()
+      session.clearAdminKey()
       serviceHealthy.value = null
       loginError.value = message
     } else {
       serviceHealthy.value = false
     }
     lastHealthError.value = message
+    loginError.value = message
+    return false
   }
+}
+
+async function refreshAdminSession() {
+  await verifyAdminSession()
 }
 
 function handleMenuSelect(key: string) {
@@ -196,11 +205,11 @@ function handleMenuSelect(key: string) {
 
 async function handleLogout() {
   try {
-    if (session.hasAdminSession) {
+    if (session.hasAdminKey) {
       await api.logoutAdminSession(session.apiContext)
     }
   } catch {}
-  session.clearAdminSession()
+  session.clearAdminKey()
   showSettings.value = false
   showMobileNav.value = false
   serviceHealthy.value = null
@@ -208,8 +217,8 @@ async function handleLogout() {
 }
 
 useAutoRefresh(
-  verifyAdminSession,
-  computed(() => session.hasAdminSession),
+  refreshAdminSession,
+  computed(() => session.hasAdminKey),
   computed(() => session.refreshIntervalSeconds * 1000),
 )
 
@@ -225,7 +234,7 @@ onMounted(() => {
       <n-notification-provider>
         <n-message-provider>
           <admin-gate
-            v-if="!session.hasAdminSession"
+            v-if="!session.hasAdminKey"
             :base-url="session.baseUrl"
             :error-message="loginError"
             :submitting="connecting"
@@ -332,7 +341,7 @@ onMounted(() => {
                     {{ lastHealthError }}
                   </p>
                   <p class="settings-hint">
-                    更换后端地址后，当前管理会话会被清空，需要重新输入密码登录。
+                    更换后端地址后，当前管理会话会被清空，需要重新输入管理密码登录。
                   </p>
                   <n-space justify="end" style="margin-top: 24px">
                     <n-button @click="showSettings = false">取消</n-button>

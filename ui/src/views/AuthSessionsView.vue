@@ -81,7 +81,7 @@ const credentialOptions = computed(() =>
 )
 
 async function load() {
-  if (!session.hasAdminSession) {
+  if (!session.hasAdminKey) {
     return
   }
   loading.value = true
@@ -175,7 +175,7 @@ async function completeBrowserAuthFromCallbackUrl() {
 
 useAutoRefresh(
   load,
-  computed(() => session.hasAdminSession),
+  computed(() => session.hasAdminKey),
   computed(() => session.refreshIntervalSeconds * 1000),
 )
 
@@ -189,9 +189,9 @@ onMounted(() => {
     <div class="page-head">
       <div>
         <div class="page-kicker">Auth Flow Ledger</div>
-        <h1 class="page-title display-font">Browser / Device Code 会话追踪</h1>
+        <h1 class="page-title display-font">认证会话</h1>
         <p class="page-subtitle">
-          这个页面专门看 Auth 过程。浏览器回调是否提交成功、device code 是否仍在轮询、取消或失败原因，都可以在这里直接看清楚。
+          查看 Browser / Device Code 会话状态与结果。
         </p>
       </div>
       <n-button secondary type="primary" :loading="loading" @click="load">

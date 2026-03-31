@@ -1,4 +1,5 @@
 use crate::config::AppConfig;
+use crate::entities::admin_key;
 use crate::entities::api_key;
 use crate::entities::auth_session;
 use crate::entities::credential;
@@ -84,11 +85,16 @@ pub struct AuthenticatedPrincipal {
     pub admin_session_created_at: Option<DateTime<Utc>>,
     pub admin_session_last_used_at: Option<DateTime<Utc>>,
     pub admin_session_expires_at: Option<DateTime<Utc>>,
+    pub admin_key_id: Option<String>,
+    pub admin_key_name: Option<String>,
+    pub admin_key_last_used_at: Option<DateTime<Utc>>,
+    pub admin_key_expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthenticatedPrincipalKind {
     AdminSession,
+    AdminKey,
     ApiKey,
 }
 
@@ -96,12 +102,14 @@ impl AuthenticatedPrincipalKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AdminSession => "admin_session",
+            Self::AdminKey => "admin_key",
             Self::ApiKey => "api_key",
         }
     }
 }
 
 const ADMIN_SESSION_TTL_DAYS: i64 = 30;
+pub const BOOTSTRAP_ADMIN_KEY_ID: &str = "bootstrap-admin-key";
 
 pub struct SelectedCredential {
     pub model: credential::Model,
@@ -138,6 +146,7 @@ impl AppState {
             .map_err(|err| AppError::internal(err.to_string()))?;
         ensure_sqlite_connection_writable(&db, &config.database_url).await?;
         initialize_database(&db).await?;
+        ensure_bootstrap_admin_key(&db, &config.admin_key_hash).await?;
         recover_auth_sessions(&db).await?;
         retain_latest_auth_session_per_credential(&db).await?;
 
@@ -311,17 +320,76 @@ impl AppState {
         require_admin: bool,
         allow_admin_session: bool,
     ) -> Result<AuthenticatedPrincipal, AppError> {
-        if allow_admin_session && let Some(record) = self.authenticate_admin_session_token(bearer) {
-            return Ok(AuthenticatedPrincipal {
-                principal_kind: AuthenticatedPrincipalKind::AdminSession,
-                api_key_id: None,
-                api_key_name: None,
-                admin_session_created_at: Some(record.created_at),
-                admin_session_last_used_at: Some(record.last_used_at),
-                admin_session_expires_at: Some(record.expires_at),
-            });
+        if require_admin {
+            if allow_admin_session
+                && let Some(record) = self.authenticate_admin_session_token(bearer)
+            {
+                return Ok(AuthenticatedPrincipal {
+                    principal_kind: AuthenticatedPrincipalKind::AdminSession,
+                    api_key_id: None,
+                    api_key_name: None,
+                    admin_session_created_at: Some(record.created_at),
+                    admin_session_last_used_at: Some(record.last_used_at),
+                    admin_session_expires_at: Some(record.expires_at),
+                    admin_key_id: None,
+                    admin_key_name: None,
+                    admin_key_last_used_at: None,
+                    admin_key_expires_at: None,
+                });
+            }
+            return self.authenticate_admin_key(bearer).await;
+        }
+        self.authenticate_api_key(bearer).await
+    }
+
+    async fn authenticate_admin_key(
+        &self,
+        bearer: &str,
+    ) -> Result<AuthenticatedPrincipal, AppError> {
+        let key_hash = hash_secret(bearer);
+        let record = admin_key::Entity::find()
+            .filter(admin_key::Column::KeyHash.eq(key_hash))
+            .one(self.db())
+            .await
+            .map_err(|err| AppError::internal(err.to_string()))?
+            .ok_or_else(|| AppError::unauthorized("invalid admin key"))?;
+
+        if !record.enabled {
+            return Err(AppError::forbidden("admin key is disabled"));
+        }
+        if let Some(expires_at) = record.expires_at
+            && expires_at < Utc::now()
+        {
+            return Err(AppError::forbidden("admin key has expired"));
         }
 
+        let admin_key_id = record.id.clone();
+        let admin_key_name = record.name.clone();
+        let admin_key_expires_at = record.expires_at;
+        let now = Utc::now();
+        let mut active = admin_key::ActiveModel::from(record);
+        active.last_used_at = Set(Some(now));
+        active.updated_at = Set(now);
+        active
+            .update(self.db())
+            .await
+            .map_err(|err| AppError::internal(err.to_string()))?;
+
+        Ok(AuthenticatedPrincipal {
+            principal_kind: AuthenticatedPrincipalKind::AdminKey,
+            api_key_id: None,
+            api_key_name: None,
+            admin_session_created_at: None,
+            admin_session_last_used_at: None,
+            admin_session_expires_at: None,
+            admin_key_id: Some(admin_key_id),
+            admin_key_name: Some(admin_key_name),
+            admin_key_last_used_at: Some(now),
+            admin_key_expires_at,
+        })
+    }
+
+    async fn authenticate_api_key(&self, bearer: &str) -> Result<AuthenticatedPrincipal, AppError> {
         let key_hash = hash_api_key(bearer);
         let record = api_key::Entity::find()
             .filter(api_key::Column::KeyHash.eq(key_hash))
@@ -337,9 +405,6 @@ impl AppState {
             && expires_at < Utc::now()
         {
             return Err(AppError::forbidden("api key has expired"));
-        }
-        if require_admin && !record.is_admin {
-            return Err(AppError::forbidden("admin privileges required"));
         }
 
         let api_key_id = record.id.clone();
@@ -359,6 +424,10 @@ impl AppState {
             admin_session_created_at: None,
             admin_session_last_used_at: None,
             admin_session_expires_at: None,
+            admin_key_id: None,
+            admin_key_name: None,
+            admin_key_last_used_at: None,
+            admin_key_expires_at: None,
         })
     }
 
@@ -993,6 +1062,7 @@ async fn initialize_database(db: &DatabaseConnection) -> Result<(), AppError> {
     let backend = db.get_database_backend();
     let credentials_table = Alias::new("credentials");
     let credential_limits_table = Alias::new("credential_limits");
+    let admin_keys_table = Alias::new("admin_keys");
     let api_keys_table = Alias::new("api_keys");
     let auth_sessions_table = Alias::new("auth_sessions");
     let request_records_table = Alias::new("request_records");
@@ -1089,6 +1159,42 @@ async fn initialize_database(db: &DatabaseConnection) -> Result<(), AppError> {
         backend.build(
             &Table::create()
                 .if_not_exists()
+                .table(admin_keys_table.clone())
+                .col(
+                    ColumnDef::new(admin_key::Column::Id)
+                        .string()
+                        .not_null()
+                        .primary_key(),
+                )
+                .col(ColumnDef::new(admin_key::Column::Name).string().not_null())
+                .col(
+                    ColumnDef::new(admin_key::Column::KeyHash)
+                        .string()
+                        .not_null()
+                        .unique_key(),
+                )
+                .col(
+                    ColumnDef::new(admin_key::Column::Enabled)
+                        .boolean()
+                        .not_null(),
+                )
+                .col(ColumnDef::new(admin_key::Column::ExpiresAt).date_time())
+                .col(ColumnDef::new(admin_key::Column::LastUsedAt).date_time())
+                .col(
+                    ColumnDef::new(admin_key::Column::CreatedAt)
+                        .date_time()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(admin_key::Column::UpdatedAt)
+                        .date_time()
+                        .not_null(),
+                )
+                .to_owned(),
+        ),
+        backend.build(
+            &Table::create()
+                .if_not_exists()
                 .table(api_keys_table.clone())
                 .col(
                     ColumnDef::new(api_key::Column::Id)
@@ -1105,11 +1211,6 @@ async fn initialize_database(db: &DatabaseConnection) -> Result<(), AppError> {
                 )
                 .col(
                     ColumnDef::new(api_key::Column::Enabled)
-                        .boolean()
-                        .not_null(),
-                )
-                .col(
-                    ColumnDef::new(api_key::Column::IsAdmin)
                         .boolean()
                         .not_null(),
                 )
@@ -1320,6 +1421,14 @@ async fn initialize_database(db: &DatabaseConnection) -> Result<(), AppError> {
         backend.build(
             &Index::create()
                 .if_not_exists()
+                .name("idx_admin_keys_enabled")
+                .table(admin_keys_table)
+                .col(admin_key::Column::Enabled)
+                .to_owned(),
+        ),
+        backend.build(
+            &Index::create()
+                .if_not_exists()
                 .name("idx_auth_sessions_credential_id")
                 .table(auth_sessions_table.clone())
                 .col(crate::entities::auth_session::Column::CredentialId)
@@ -1372,6 +1481,47 @@ async fn initialize_database(db: &DatabaseConnection) -> Result<(), AppError> {
             .await
             .map_err(|err| AppError::internal(err.to_string()))?;
     }
+
+    Ok(())
+}
+
+async fn ensure_bootstrap_admin_key(
+    db: &DatabaseConnection,
+    admin_key_hash: &str,
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    let existing = admin_key::Entity::find_by_id(BOOTSTRAP_ADMIN_KEY_ID.to_string())
+        .one(db)
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
+
+    if let Some(model) = existing {
+        let mut active = admin_key::ActiveModel::from(model);
+        active.name = Set("bootstrap".to_string());
+        active.key_hash = Set(admin_key_hash.to_string());
+        active.enabled = Set(true);
+        active.expires_at = Set(None);
+        active.updated_at = Set(now);
+        active
+            .update(db)
+            .await
+            .map_err(|err| AppError::internal(err.to_string()))?;
+        return Ok(());
+    }
+
+    admin_key::ActiveModel {
+        id: Set(BOOTSTRAP_ADMIN_KEY_ID.to_string()),
+        name: Set("bootstrap".to_string()),
+        key_hash: Set(admin_key_hash.to_string()),
+        enabled: Set(true),
+        expires_at: Set(None),
+        last_used_at: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await
+    .map_err(|err| AppError::internal(err.to_string()))?;
 
     Ok(())
 }

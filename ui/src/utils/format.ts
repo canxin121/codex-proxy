@@ -61,13 +61,19 @@ export function truncateMiddle(value?: string | null, head = 8, tail = 8) {
   return `${value.slice(0, head)}...${value.slice(-tail)}`
 }
 
+function trimTrailingZeros(value: string) {
+  return value.replace(/(?:\.0+|(\.\d+?)0+)$/, '$1')
+}
+
 export function formatTokenCompact(value?: number | null) {
-  const numeric = value ?? 0
-  if (numeric >= 1_000_000) {
-    return `${(numeric / 1_000_000).toFixed(1)}M`
-  }
-  if (numeric >= 1000) {
-    return `${(numeric / 1000).toFixed(1)}K`
-  }
-  return formatNumber(numeric)
+  const numeric = Math.max(0, value ?? 0)
+  const inMillions = numeric / 1_000_000
+  const fractionDigits =
+    inMillions >= 100 ? 0
+      : inMillions >= 10 ? 1
+        : inMillions >= 1 ? 2
+          : inMillions >= 0.1 ? 3
+            : inMillions >= 0.01 ? 4
+              : 5
+  return `${trimTrailingZeros(inMillions.toFixed(fractionDigits))}m`
 }

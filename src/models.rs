@@ -1,3 +1,4 @@
+use crate::entities::admin_key;
 use crate::entities::api_key;
 use crate::entities::auth_session;
 use crate::entities::credential;
@@ -96,18 +97,22 @@ pub struct AdminLoginRequest {
 #[derive(Debug, Serialize)]
 pub struct AdminSessionView {
     pub principal_kind: String,
-    #[serde(rename = "api_key_id")]
-    pub api_key_id: Option<String>,
-    #[serde(rename = "api_key_name")]
-    pub api_key_name: Option<String>,
+    #[serde(rename = "admin_key_id")]
+    pub admin_key_id: Option<String>,
+    #[serde(rename = "admin_key_name")]
+    pub admin_key_name: Option<String>,
     #[serde(rename = "console_refresh_interval_seconds")]
     pub console_refresh_interval_seconds: i32,
     #[serde(rename = "admin_session_created_at")]
-    pub created_at: Option<DateTime<Utc>>,
+    pub admin_session_created_at: Option<DateTime<Utc>>,
     #[serde(rename = "admin_session_last_used_at")]
-    pub last_used_at: Option<DateTime<Utc>>,
+    pub admin_session_last_used_at: Option<DateTime<Utc>>,
     #[serde(rename = "admin_session_expires_at")]
-    pub expires_at: Option<DateTime<Utc>>,
+    pub admin_session_expires_at: Option<DateTime<Utc>>,
+    #[serde(rename = "admin_key_last_used_at")]
+    pub admin_key_last_used_at: Option<DateTime<Utc>>,
+    #[serde(rename = "admin_key_expires_at")]
+    pub admin_key_expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -414,12 +419,6 @@ pub struct RequestBreakdownView {
 }
 
 #[derive(Debug, Serialize, Default, Clone)]
-pub struct CredentialModelBreakdownView {
-    pub credential: RequestBreakdownView,
-    pub models: Vec<RequestBreakdownView>,
-}
-
-#[derive(Debug, Serialize, Default, Clone)]
 pub struct UsageStatsFiltersView {
     #[serde(rename = "credential_id")]
     pub credential_id: Option<String>,
@@ -439,13 +438,6 @@ pub struct UsageStatsView {
     pub duration: RequestDurationStatsView,
     pub hourly: Vec<UsageTimeBucketView>,
     pub daily: Vec<UsageTimeBucketView>,
-    pub credentials: Vec<RequestBreakdownView>,
-    #[serde(rename = "credential_model_groups")]
-    pub credential_model_groups: Vec<CredentialModelBreakdownView>,
-    #[serde(rename = "api_keys")]
-    pub api_keys: Vec<RequestBreakdownView>,
-    pub models: Vec<RequestBreakdownView>,
-    pub paths: Vec<RequestBreakdownView>,
     pub transports: Vec<RequestBreakdownView>,
     #[serde(rename = "status_codes")]
     pub status_codes: Vec<RequestBreakdownView>,
@@ -547,18 +539,38 @@ pub struct StatsOverviewView {
     pub enabled_api_key_count: i64,
     #[serde(rename = "pending_auth_session_count")]
     pub pending_auth_session_count: i64,
+    #[serde(rename = "limit_overview")]
+    pub limit_overview: LimitOverviewView,
     #[serde(rename = "request_stats")]
     pub request_stats: RequestStatsSummaryView,
     #[serde(rename = "latest_request_errors")]
     pub latest_request_errors: Vec<LastRequestErrorView>,
 }
 
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct LimitOverviewView {
+    #[serde(rename = "enabled_credential_count")]
+    pub enabled_credential_count: i64,
+    #[serde(rename = "tracked_credential_count")]
+    pub tracked_credential_count: i64,
+    #[serde(rename = "untracked_credential_count")]
+    pub untracked_credential_count: i64,
+    #[serde(rename = "has_credits_credential_count")]
+    pub has_credits_credential_count: i64,
+    #[serde(rename = "average_remaining_percent")]
+    pub average_remaining_percent: Option<f64>,
+    #[serde(rename = "minimum_remaining_percent")]
+    pub minimum_remaining_percent: Option<f64>,
+    #[serde(rename = "next_reset_at")]
+    pub next_reset_at: Option<DateTime<Utc>>,
+    #[serde(rename = "last_snapshot_at")]
+    pub last_snapshot_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateApiKeyRequest {
     #[serde(rename = "api_key_name")]
     pub name: String,
-    #[serde(rename = "has_admin_access")]
-    pub is_admin: Option<bool>,
     #[serde(rename = "api_key_expires_at")]
     pub expires_at: Option<DateTime<Utc>>,
 }
@@ -581,8 +593,6 @@ pub struct ApiKeyView {
     pub name: String,
     #[serde(rename = "is_enabled")]
     pub enabled: bool,
-    #[serde(rename = "has_admin_access")]
-    pub is_admin: bool,
     #[serde(rename = "api_key_expires_at")]
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(rename = "last_api_key_used_at")]
@@ -601,6 +611,50 @@ pub struct ApiKeyView {
 pub struct CreateApiKeyResponse {
     pub api_key_value: String,
     pub api_key_record: ApiKeyView,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateAdminKeyRequest {
+    #[serde(rename = "admin_key_name")]
+    pub name: String,
+    #[serde(rename = "admin_key_expires_at")]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateAdminKeyRequest {
+    #[serde(rename = "admin_key_name")]
+    pub name: Option<String>,
+    #[serde(rename = "is_enabled")]
+    pub enabled: Option<bool>,
+    #[serde(rename = "admin_key_expires_at")]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminKeyView {
+    #[serde(rename = "admin_key_id")]
+    pub id: String,
+    #[serde(rename = "admin_key_name")]
+    pub name: String,
+    #[serde(rename = "is_enabled")]
+    pub enabled: bool,
+    #[serde(rename = "is_bootstrap")]
+    pub is_bootstrap: bool,
+    #[serde(rename = "admin_key_expires_at")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(rename = "last_admin_key_used_at")]
+    pub last_used_at: Option<DateTime<Utc>>,
+    #[serde(rename = "admin_key_created_at")]
+    pub created_at: DateTime<Utc>,
+    #[serde(rename = "admin_key_updated_at")]
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateAdminKeyResponse {
+    pub admin_key_value: String,
+    pub admin_key_record: AdminKeyView,
 }
 
 #[derive(Debug, Serialize)]
@@ -884,11 +938,25 @@ impl ApiKeyView {
             id: model.id,
             name: model.name,
             enabled: model.enabled,
-            is_admin: model.is_admin,
             expires_at: model.expires_at,
             last_used_at: model.last_used_at,
             request_stats,
             last_request_error,
+            created_at: model.created_at,
+            updated_at: model.updated_at,
+        }
+    }
+}
+
+impl AdminKeyView {
+    pub fn from_model(model: admin_key::Model, is_bootstrap: bool) -> Self {
+        Self {
+            id: model.id,
+            name: model.name,
+            enabled: model.enabled,
+            is_bootstrap,
+            expires_at: model.expires_at,
+            last_used_at: model.last_used_at,
             created_at: model.created_at,
             updated_at: model.updated_at,
         }

@@ -32,6 +32,14 @@ const router = createRouter({
       },
     },
     {
+      path: '/admin-keys',
+      name: 'admin-keys',
+      component: () => import('@/views/AdminKeysView.vue'),
+      meta: {
+        label: 'Admin Keys',
+      },
+    },
+    {
       path: '/requests',
       name: 'requests',
       component: () => import('@/views/RequestsView.vue'),

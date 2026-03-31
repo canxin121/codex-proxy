@@ -1,11 +1,12 @@
 use crate::entities::api_key;
 use crate::entities::auth_session;
 use crate::entities::credential;
+use crate::entities::credential_limit;
 use crate::entities::request_record;
 use crate::error::AppError;
 use crate::models::AuthStatus;
-use crate::models::CredentialModelBreakdownView;
 use crate::models::LastRequestErrorView;
+use crate::models::LimitOverviewView;
 use crate::models::ListRequestRecordsQuery;
 use crate::models::PaginatedResponse;
 use crate::models::RequestBreakdownRow;
@@ -37,12 +38,12 @@ use sea_orm::QuerySelect;
 use sea_orm::Select;
 use sea_orm::Set;
 use sea_orm::sea_query::Alias;
-use sea_orm::sea_query::BinOper;
 use sea_orm::sea_query::Condition;
 use sea_orm::sea_query::Expr;
 use sea_orm::sea_query::Func;
 use sea_orm::sea_query::SimpleExpr;
 use serde_json::Value;
+use std::collections::HashMap;
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
@@ -84,10 +85,6 @@ impl TimeBucket {
 
 #[derive(Copy, Clone)]
 enum BreakdownDimension {
-    Credential,
-    ApiKey,
-    Model,
-    Path,
     Transport,
     StatusCode,
     ErrorPhase,
@@ -96,19 +93,6 @@ enum BreakdownDimension {
 impl BreakdownDimension {
     fn expressions(self) -> (SimpleExpr, SimpleExpr) {
         match self {
-            Self::Credential => (
-                Expr::col(request_record::Column::CredentialId).into(),
-                Expr::col(request_record::Column::CredentialName).into(),
-            ),
-            Self::ApiKey => (
-                Expr::col(request_record::Column::ApiKeyId).if_null("system"),
-                Expr::col(request_record::Column::ApiKeyName).if_null("system/admin"),
-            ),
-            Self::Model => (
-                Expr::col(request_record::Column::RequestedModel).if_null("unknown"),
-                Expr::col(request_record::Column::RequestedModel).if_null("unknown"),
-            ),
-            Self::Path => (path_expression(), path_expression()),
             Self::Transport => (
                 Expr::col(request_record::Column::Transport).into(),
                 Expr::col(request_record::Column::Transport).into(),
@@ -587,19 +571,7 @@ pub async fn usage_stats(
     let credential_id = query.credential_id.as_deref();
     let api_key_id = query.api_key_id.as_deref();
 
-    let (
-        summary,
-        duration,
-        hourly,
-        daily,
-        credentials,
-        api_keys,
-        models,
-        paths,
-        transports,
-        status_codes,
-        error_phases,
-    ) = tokio::try_join!(
+    let (summary, duration, hourly, daily, transports, status_codes, error_phases) = tokio::try_join!(
         request_stats_with_scope(state, credential_id, api_key_id, only_failures),
         duration_stats_with_scope(state, credential_id, api_key_id, only_failures),
         usage_time_buckets_with_scope(
@@ -615,38 +587,6 @@ pub async fn usage_stats(
             api_key_id,
             only_failures,
             TimeBucket::Day
-        ),
-        request_breakdown_with_scope(
-            state,
-            credential_id,
-            api_key_id,
-            only_failures,
-            BreakdownDimension::Credential,
-            top,
-        ),
-        request_breakdown_with_scope(
-            state,
-            credential_id,
-            api_key_id,
-            only_failures,
-            BreakdownDimension::ApiKey,
-            top,
-        ),
-        request_breakdown_with_scope(
-            state,
-            credential_id,
-            api_key_id,
-            only_failures,
-            BreakdownDimension::Model,
-            top,
-        ),
-        request_breakdown_with_scope(
-            state,
-            credential_id,
-            api_key_id,
-            only_failures,
-            BreakdownDimension::Path,
-            top,
         ),
         request_breakdown_with_scope(
             state,
@@ -674,10 +614,6 @@ pub async fn usage_stats(
         ),
     )?;
 
-    let credential_model_groups =
-        credential_model_groups_with_scope(state, &credentials, api_key_id, only_failures, top)
-            .await?;
-
     Ok(UsageStatsView {
         generated_at: Utc::now(),
         filters: UsageStatsFiltersView {
@@ -690,11 +626,6 @@ pub async fn usage_stats(
         duration,
         hourly,
         daily,
-        credentials,
-        credential_model_groups,
-        api_keys,
-        models,
-        paths,
         transports,
         status_codes,
         error_phases,
@@ -774,18 +705,19 @@ pub async fn list_request_records(
 }
 
 pub async fn stats_overview(state: &AppState) -> Result<StatsOverviewView, AppError> {
-    let enabled_credential_count = credential::Entity::find()
-        .filter(credential::Column::Enabled.eq(true))
-        .count(state.db())
-        .await
-        .map_err(|err| AppError::internal(err.to_string()))?;
-
     let credential_models = credential::Entity::find()
         .all(state.db())
         .await
         .map_err(|err| AppError::internal(err.to_string()))?;
+    let enabled_credential_count =
+        credential_models.iter().filter(|item| item.enabled).count() as i64;
+    let enabled_credential_ids = credential_models
+        .iter()
+        .filter(|item| item.enabled)
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
     let mut authenticated_credential_count = 0_i64;
-    for credential_model in credential_models {
+    for credential_model in &credential_models {
         if state
             .auth_manager(&credential_model.id)
             .await
@@ -796,6 +728,8 @@ pub async fn stats_overview(state: &AppState) -> Result<StatsOverviewView, AppEr
             authenticated_credential_count += 1;
         }
     }
+    let limit_overview =
+        limit_overview_for_enabled_credentials(state, enabled_credential_ids).await?;
 
     let total_api_key_count = api_key::Entity::find()
         .count(state.db())
@@ -815,14 +749,125 @@ pub async fn stats_overview(state: &AppState) -> Result<StatsOverviewView, AppEr
     Ok(StatsOverviewView {
         generated_at: Utc::now(),
         active_request_count: state.active_requests_total(),
-        enabled_credential_count: enabled_credential_count as i64,
+        enabled_credential_count,
         authenticated_credential_count,
         total_api_key_count: total_api_key_count as i64,
         enabled_api_key_count: enabled_api_key_count as i64,
         pending_auth_session_count: pending_auth_session_count as i64,
+        limit_overview,
         request_stats: request_stats_overall(state).await?,
         latest_request_errors: latest_request_errors(state, 10).await?,
     })
+}
+
+async fn limit_overview_for_enabled_credentials(
+    state: &AppState,
+    enabled_credential_ids: Vec<String>,
+) -> Result<LimitOverviewView, AppError> {
+    let enabled_credential_count = enabled_credential_ids.len() as i64;
+    if enabled_credential_ids.is_empty() {
+        return Ok(LimitOverviewView {
+            enabled_credential_count,
+            ..LimitOverviewView::default()
+        });
+    }
+    let snapshots = credential_limit::Entity::find()
+        .filter(credential_limit::Column::CredentialId.is_in(enabled_credential_ids.clone()))
+        .all(state.db())
+        .await
+        .map_err(|err| AppError::internal(err.to_string()))?;
+
+    let mut snapshots_by_credential = HashMap::<String, Vec<credential_limit::Model>>::new();
+    for snapshot in snapshots {
+        snapshots_by_credential
+            .entry(snapshot.credential_id.clone())
+            .or_default()
+            .push(snapshot);
+    }
+
+    let mut tracked_credential_count = 0_i64;
+    let mut has_credits_credential_count = 0_i64;
+    let mut average_remaining_sum = 0.0_f64;
+    let mut minimum_remaining_percent: Option<f64> = None;
+    let mut next_reset_at: Option<DateTime<Utc>> = None;
+    let mut last_snapshot_at: Option<DateTime<Utc>> = None;
+    let now = Utc::now();
+
+    for credential_id in enabled_credential_ids {
+        let Some(rows) = snapshots_by_credential.get(&credential_id) else {
+            continue;
+        };
+        if rows.is_empty() {
+            continue;
+        }
+
+        tracked_credential_count += 1;
+
+        let credential_remaining = rows
+            .iter()
+            .map(limit_remaining_percent_from_snapshot)
+            .fold(100.0, f64::min);
+        average_remaining_sum += credential_remaining;
+        minimum_remaining_percent = Some(match minimum_remaining_percent {
+            Some(current) => current.min(credential_remaining),
+            None => credential_remaining,
+        });
+
+        if rows
+            .iter()
+            .any(|row| row.unlimited == Some(true) || row.has_credits == Some(true))
+        {
+            has_credits_credential_count += 1;
+        }
+
+        for row in rows {
+            for reset_at in [row.primary_resets_at, row.secondary_resets_at]
+                .into_iter()
+                .flatten()
+            {
+                if reset_at >= now {
+                    next_reset_at = Some(match next_reset_at {
+                        Some(current) => current.min(reset_at),
+                        None => reset_at,
+                    });
+                }
+            }
+
+            last_snapshot_at = Some(match last_snapshot_at {
+                Some(current) => current.max(row.updated_at),
+                None => row.updated_at,
+            });
+        }
+    }
+
+    let average_remaining_percent = if tracked_credential_count > 0 {
+        Some(average_remaining_sum / (tracked_credential_count as f64))
+    } else {
+        None
+    };
+
+    Ok(LimitOverviewView {
+        enabled_credential_count,
+        tracked_credential_count,
+        untracked_credential_count: (enabled_credential_count - tracked_credential_count).max(0),
+        has_credits_credential_count,
+        average_remaining_percent,
+        minimum_remaining_percent,
+        next_reset_at,
+        last_snapshot_at,
+    })
+}
+
+fn limit_remaining_percent_from_snapshot(limit: &credential_limit::Model) -> f64 {
+    let primary = limit
+        .primary_used_percent
+        .map(|value| (100.0 - value).clamp(0.0, 100.0))
+        .unwrap_or(100.0);
+    let secondary = limit
+        .secondary_used_percent
+        .map(|value| (100.0 - value).clamp(0.0, 100.0))
+        .unwrap_or(100.0);
+    primary.min(secondary)
 }
 
 pub fn extract_requested_model_from_bytes(bytes: &[u8]) -> Option<String> {
@@ -1086,35 +1131,6 @@ async fn request_breakdown_with_scope(
         .collect())
 }
 
-async fn credential_model_groups_with_scope(
-    state: &AppState,
-    credentials: &[RequestBreakdownView],
-    api_key_id: Option<&str>,
-    only_failures: bool,
-    top: u64,
-) -> Result<Vec<CredentialModelBreakdownView>, AppError> {
-    let mut groups = Vec::with_capacity(credentials.len());
-
-    for credential in credentials {
-        let models = request_breakdown_with_scope(
-            state,
-            Some(credential.key.as_str()),
-            api_key_id,
-            only_failures,
-            BreakdownDimension::Model,
-            top,
-        )
-        .await?;
-
-        groups.push(CredentialModelBreakdownView {
-            credential: credential.clone(),
-            models,
-        });
-    }
-
-    Ok(groups)
-}
-
 async fn latest_request_errors_with_scope(
     state: &AppState,
     credential_id: Option<&str>,
@@ -1175,15 +1191,6 @@ fn success_timestamp_expr(success: bool) -> SimpleExpr {
             .if_null(Expr::col(request_record::Column::RequestStartedAt)),
     ))
     .into()
-}
-
-fn path_expression() -> SimpleExpr {
-    Expr::col(request_record::Column::RequestMethod)
-        .binary(BinOper::Custom("||"), Expr::val(" "))
-        .binary(
-            BinOper::Custom("||"),
-            Expr::col(request_record::Column::RequestPath),
-        )
 }
 
 fn process_sse_frame(frame: &str, observation: &mut RequestObservation) {

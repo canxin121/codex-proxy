@@ -15,13 +15,15 @@ export interface PaginationQuery {
 }
 
 export interface AdminSessionView {
-  principal_kind: 'admin_session' | 'api_key'
-  api_key_id: string | null
-  api_key_name: string | null
+  principal_kind: 'admin_session' | 'admin_key'
+  admin_key_id: string | null
+  admin_key_name: string | null
   console_refresh_interval_seconds: number
   admin_session_created_at: string | null
   admin_session_last_used_at: string | null
   admin_session_expires_at: string | null
+  admin_key_last_used_at: string | null
+  admin_key_expires_at: string | null
 }
 
 export interface AdminLoginPayload {
@@ -80,11 +82,6 @@ export interface RequestBreakdownView {
   token_usage: RequestUsageTotalsView
 }
 
-export interface CredentialModelBreakdownView {
-  credential: RequestBreakdownView
-  models: RequestBreakdownView[]
-}
-
 export interface UsageStatsFiltersView {
   credential_id: string | null
   api_key_id: string | null
@@ -99,11 +96,6 @@ export interface UsageStatsView {
   duration: RequestDurationStatsView
   hourly: UsageTimeBucketView[]
   daily: UsageTimeBucketView[]
-  credentials: RequestBreakdownView[]
-  credential_model_groups: CredentialModelBreakdownView[]
-  api_keys: RequestBreakdownView[]
-  models: RequestBreakdownView[]
-  paths: RequestBreakdownView[]
   transports: RequestBreakdownView[]
   status_codes: RequestBreakdownView[]
   error_phases: RequestBreakdownView[]
@@ -190,7 +182,6 @@ export interface ApiKeyView {
   api_key_id: string
   api_key_name: string
   is_enabled: boolean
-  has_admin_access: boolean
   api_key_expires_at: string | null
   last_api_key_used_at: string | null
   request_stats: RequestStatsSummaryView
@@ -199,9 +190,25 @@ export interface ApiKeyView {
   api_key_updated_at: string
 }
 
+export interface AdminKeyView {
+  admin_key_id: string
+  admin_key_name: string
+  is_enabled: boolean
+  is_bootstrap: boolean
+  admin_key_expires_at: string | null
+  last_admin_key_used_at: string | null
+  admin_key_created_at: string
+  admin_key_updated_at: string
+}
+
 export interface CreateApiKeyResponse {
   api_key_value: string
   api_key_record: ApiKeyView
+}
+
+export interface CreateAdminKeyResponse {
+  admin_key_value: string
+  admin_key_record: AdminKeyView
 }
 
 export interface RequestRecordView {
@@ -236,8 +243,20 @@ export interface StatsOverviewView {
   total_api_key_count: number
   enabled_api_key_count: number
   pending_auth_session_count: number
+  limit_overview: LimitOverviewView
   request_stats: RequestStatsSummaryView
   latest_request_errors: LastRequestErrorView[]
+}
+
+export interface LimitOverviewView {
+  enabled_credential_count: number
+  tracked_credential_count: number
+  untracked_credential_count: number
+  has_credits_credential_count: number
+  average_remaining_percent: number | null
+  minimum_remaining_percent: number | null
+  next_reset_at: string | null
+  last_snapshot_at: string | null
 }
 
 export interface CreateCredentialPayload {}
@@ -270,7 +289,6 @@ export interface StartDeviceCodeAuthPayload {
 
 export interface CreateApiKeyPayload {
   api_key_name: string
-  has_admin_access?: boolean
   api_key_expires_at?: string | null
 }
 
@@ -278,6 +296,17 @@ export interface UpdateApiKeyPayload {
   api_key_name?: string
   is_enabled?: boolean
   api_key_expires_at?: string | null
+}
+
+export interface CreateAdminKeyPayload {
+  admin_key_name: string
+  admin_key_expires_at?: string | null
+}
+
+export interface UpdateAdminKeyPayload {
+  admin_key_name?: string
+  is_enabled?: boolean
+  admin_key_expires_at?: string | null
 }
 
 export interface RequestQuery {

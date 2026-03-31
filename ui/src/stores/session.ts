@@ -1,12 +1,12 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 
-const STORAGE_KEY = 'codex-proxy-console.session'
+const STORAGE_KEY = 'codex-proxy-console.v2.session'
 const FALLBACK_REFRESH_INTERVAL_SECONDS = 15
 
 interface StoredSession {
   baseUrl: string
-  adminSessionToken: string
+  adminKey: string
   refreshIntervalSeconds: number
 }
 
@@ -19,26 +19,23 @@ function readStoredSession(): StoredSession {
   if (!raw) {
     return {
       baseUrl: defaultBaseUrl(),
-      adminSessionToken: '',
+      adminKey: '',
       refreshIntervalSeconds: FALLBACK_REFRESH_INTERVAL_SECONDS,
     }
   }
 
   try {
-    const parsed = JSON.parse(raw) as Partial<StoredSession> & {
-      pollIntervalSeconds?: number
-    }
-    const savedRefreshInterval =
-      parsed.refreshIntervalSeconds ?? parsed.pollIntervalSeconds ?? FALLBACK_REFRESH_INTERVAL_SECONDS
+    const parsed = JSON.parse(raw) as Partial<StoredSession>
+    const savedRefreshInterval = parsed.refreshIntervalSeconds ?? FALLBACK_REFRESH_INTERVAL_SECONDS
     return {
       baseUrl: parsed.baseUrl?.trim() || defaultBaseUrl(),
-      adminSessionToken: parsed.adminSessionToken?.trim() || '',
+      adminKey: parsed.adminKey?.trim() || '',
       refreshIntervalSeconds: Math.max(5, Math.min(savedRefreshInterval, 120)),
     }
   } catch {
     return {
       baseUrl: defaultBaseUrl(),
-      adminSessionToken: '',
+      adminKey: '',
       refreshIntervalSeconds: FALLBACK_REFRESH_INTERVAL_SECONDS,
     }
   }
@@ -47,19 +44,19 @@ function readStoredSession(): StoredSession {
 export const useSessionStore = defineStore('session', () => {
   const stored = readStoredSession()
   const baseUrl = ref(stored.baseUrl)
-  const adminSessionToken = ref(stored.adminSessionToken)
+  const adminKey = ref(stored.adminKey)
   const refreshIntervalSeconds = ref(stored.refreshIntervalSeconds)
 
-  const hasAdminSession = computed(() => adminSessionToken.value.trim().length > 0)
+  const hasAdminKey = computed(() => adminKey.value.trim().length > 0)
   const apiContext = computed(() => ({
     baseUrl: baseUrl.value.trim().replace(/\/+$/, ''),
-    adminSessionToken: adminSessionToken.value.trim(),
+    adminKey: adminKey.value.trim(),
   }))
 
   function persist() {
     const payload: StoredSession = {
       baseUrl: baseUrl.value.trim() || defaultBaseUrl(),
-      adminSessionToken: adminSessionToken.value.trim(),
+      adminKey: adminKey.value.trim(),
       refreshIntervalSeconds: Math.max(5, Math.min(refreshIntervalSeconds.value, 120)),
     }
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
@@ -69,8 +66,8 @@ export const useSessionStore = defineStore('session', () => {
     if (patch.baseUrl !== undefined) {
       baseUrl.value = patch.baseUrl
     }
-    if (patch.adminSessionToken !== undefined) {
-      adminSessionToken.value = patch.adminSessionToken
+    if (patch.adminKey !== undefined) {
+      adminKey.value = patch.adminKey
     }
     if (patch.refreshIntervalSeconds !== undefined) {
       refreshIntervalSeconds.value = Math.max(5, Math.min(patch.refreshIntervalSeconds, 120))
@@ -78,17 +75,17 @@ export const useSessionStore = defineStore('session', () => {
     persist()
   }
 
-  function clearAdminSession() {
-    adminSessionToken.value = ''
+  function clearAdminKey() {
+    adminKey.value = ''
     persist()
   }
 
   return {
-    adminSessionToken,
+    adminKey,
     apiContext,
     baseUrl,
-    clearAdminSession,
-    hasAdminSession,
+    clearAdminKey,
+    hasAdminKey,
     persist,
     refreshIntervalSeconds,
     updateSession,

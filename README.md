@@ -64,6 +64,8 @@ Then run `codex-proxy`; opening the root URL will show the admin console.
 
 - Stores many ChatGPT-backed Codex credentials.
 - Generates and validates proxy-side API keys for your own devices and clients.
+- Supports dedicated admin keys for automation scripts.
+- Supports password-based admin-session login for human web-console usage.
 - Supports two admin auth flows:
   - browser auth via manual callback URL submission
   - device-code auth via background completion
@@ -99,7 +101,9 @@ Both `/responses` and `/v1/responses` style paths are supported.
 ```bash
 cargo run -- \
   --bind 127.0.0.1:8787 \
-  --data-dir /tmp/codex-proxy
+  --data-dir /tmp/codex-proxy \
+  --admin-password 'your-console-password' \
+  --admin-key 'your-bootstrap-admin-key'
 ```
 
 Useful auth-related options:
@@ -114,13 +118,19 @@ Useful auth-related options:
 
 To stay aligned with the official Codex browser login flow, `--auth-callback-url` must remain an explicit loopback HTTP URL such as `http://localhost:1455/auth/callback`.
 
-If `CODEX_PROXY_ADMIN_TOKEN` is not set, the service generates one at startup and prints it to logs.
-
 ## Important routes
 
 - `GET /healthz`
 - `GET /readyz`
 - `GET /`
+- `GET /admin/session`
+- `POST /admin/session/login`
+- `POST /admin/session/logout`
+- `GET /admin/admin-keys`
+- `POST /admin/admin-keys`
+- `GET /admin/admin-keys/:id`
+- `PATCH /admin/admin-keys/:id`
+- `DELETE /admin/admin-keys/:id`
 - `GET /admin/credentials`
 - `POST /admin/credentials`
 - `POST /admin/credentials/import-json`
@@ -147,10 +157,10 @@ If `CODEX_PROXY_ADMIN_TOKEN` is not set, the service generates one at startup an
 Admin routes require:
 
 ```http
-Authorization: Bearer <admin-token>
+Authorization: Bearer <admin-session-token or admin-key>
 ```
 
-Proxy routes require either the admin token or a generated proxy API key.
+Proxy routes require a generated proxy API key.
 
 `GET /admin/credentials` and `GET /admin/api-keys` now include:
 
@@ -293,7 +303,6 @@ Create a proxy API key:
 ```json
 {
   "api_key_name": "laptop",
-  "has_admin_access": false,
   "api_key_expires_at": null
 }
 ```
