@@ -69,6 +69,8 @@ const showFormModal = ref(false)
 const editingCredential = ref<CredentialView | null>(null)
 const importAuthMethod = ref<'browser' | 'device_code' | 'json'>('browser')
 const importJsonText = ref('')
+const importJsonFileName = ref('')
+const importJsonFileInput = ref<HTMLInputElement | null>(null)
 const showBrowserModal = ref(false)
 const browserSession = ref<AuthSessionView | null>(null)
 const browserCallbackUrl = ref('')
@@ -146,6 +148,7 @@ function openCreateModal() {
   editingCredential.value = null
   importAuthMethod.value = 'browser'
   importJsonText.value = ''
+  importJsonFileName.value = ''
   showFormModal.value = true
 }
 
@@ -298,9 +301,33 @@ async function importCredentialFromJson() {
 
   const imported = await api.importCredentialJson(session.apiContext, parsed)
   importJsonText.value = ''
+  importJsonFileName.value = ''
   showFormModal.value = false
   message.success(`JSON 导入成功：${imported.credential_name}`)
   await load()
+}
+
+function pickImportJsonFile() {
+  importJsonFileInput.value?.click()
+}
+
+async function handleImportJsonFileChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) {
+    return
+  }
+
+  try {
+    const content = await file.text()
+    importJsonText.value = content
+    importJsonFileName.value = file.name
+    message.success(`已读取文件：${file.name}`)
+  } catch (error) {
+    message.error(error instanceof Error ? `读取文件失败：${error.message}` : '读取文件失败')
+  } finally {
+    input.value = ''
+  }
 }
 
 async function refreshCredential(item: CredentialView) {
@@ -719,12 +746,27 @@ onMounted(() => {
                   ? '创建授权链接后完成登录，再提交 callback URL。'
                   : importAuthMethod === 'device_code'
                     ? '会生成 verification URL 和 user code，后端自动轮询完成。'
-                    : '粘贴 auth.json 后直接导入。'
+                    : '支持粘贴 auth.json 文本，或直接选择 auth.json 文件导入。'
               }}
             </div>
           </div>
 
           <n-form v-if="importAuthMethod === 'json'" label-placement="top">
+            <n-form-item label="凭证文件（可选）">
+              <n-space align="center" wrap>
+                <input
+                  ref="importJsonFileInput"
+                  type="file"
+                  accept=".json,application/json"
+                  class="file-input-hidden"
+                  @change="handleImportJsonFileChange"
+                />
+                <n-button secondary @click="pickImportJsonFile">选择 JSON 文件</n-button>
+                <span class="filter-label">
+                  {{ importJsonFileName ? `已选择：${importJsonFileName}` : '未选择文件（也可直接粘贴）' }}
+                </span>
+              </n-space>
+            </n-form-item>
             <n-form-item label="凭证 JSON">
               <n-input
                 v-model:value="importJsonText"
@@ -1101,6 +1143,10 @@ onMounted(() => {
   margin-top: 8px;
   color: var(--cp-text-soft);
   line-height: 1.7;
+}
+
+.file-input-hidden {
+  display: none;
 }
 
 .empty-state {

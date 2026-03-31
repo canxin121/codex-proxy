@@ -271,7 +271,7 @@ function setHoveredIndex(index: number | null) {
       <svg
         class="chart-svg"
         :viewBox="`0 0 ${viewBoxWidth} ${viewBoxHeight}`"
-        preserveAspectRatio="none"
+        preserveAspectRatio="xMidYMid meet"
       >
         <g class="chart-grid">
           <g v-for="line in gridLines" :key="`grid-${line.y}`">
@@ -434,7 +434,9 @@ function setHoveredIndex(index: number | null) {
 
 .chart-svg {
   width: 100%;
-  height: 280px;
+  height: auto;
+  aspect-ratio: 920 / 300;
+  display: block;
   overflow: visible;
 }
 

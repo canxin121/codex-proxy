@@ -65,6 +65,39 @@ const successRate = computed(() => {
   return formatPercent((current.success_request_count / current.total_request_count) * 100)
 })
 
+const dailyRequestTrendSeries = computed(() => {
+  const daily = (usage.value?.daily ?? []).slice(-14)
+  return [
+    {
+      key: 'total',
+      name: '总请求',
+      color: '#0f6a58',
+      points: daily.map((item) => ({
+        label: item.bucket.slice(5),
+        value: item.total_request_count,
+      })),
+    },
+    {
+      key: 'success',
+      name: '成功',
+      color: '#1f7c57',
+      points: daily.map((item) => ({
+        label: item.bucket.slice(5),
+        value: item.success_request_count,
+      })),
+    },
+    {
+      key: 'failure',
+      name: '失败',
+      color: '#b4493f',
+      points: daily.map((item) => ({
+        label: item.bucket.slice(5),
+        value: item.failure_request_count,
+      })),
+    },
+  ]
+})
+
 const dailyTokenTrendSeries = computed(() => {
   const daily = (usage.value?.daily ?? []).slice(-14)
   return [
@@ -300,7 +333,19 @@ onMounted(() => {
         <template #header>
           <div class="section-headline">
             <div>
-              <div class="section-title">Token 趋势（多曲线）</div>
+              <div class="section-title">请求趋势</div>
+              <div class="section-note">最近 14 个自然日，合并展示总请求、成功、失败</div>
+            </div>
+          </div>
+        </template>
+        <multi-trend-chart :series="dailyRequestTrendSeries" />
+      </n-card>
+
+      <n-card class="section-card app-shell-card" :bordered="false">
+        <template #header>
+          <div class="section-headline">
+            <div>
+              <div class="section-title">Token 趋势</div>
               <div class="section-note">最近 14 个自然日，合并展示输入、缓存、输出、思考与总量</div>
             </div>
           </div>
