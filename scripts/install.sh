@@ -20,7 +20,7 @@ Usage:
 
 Installer options:
   --repo <owner/name>          GitHub repository to download from
-  --version <tag>              Release tag to install, for example v0.1.2
+  --version <tag>              Release tag to install, for example v0.1.3
   --target <triple>            Force a specific release target
   --install-bin-dir <path>     Directory for the user-facing launcher
   --install-share-dir <path>   Directory for shared files and the real binary
@@ -34,7 +34,7 @@ installed `codex-proxy` launcher runs.
 Example:
   curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh \
     | bash -s -- \
-        --version v0.1.2 \
+        --version v0.1.3 \
         --install-bin-dir "$HOME/.local/bin" \
         --install-share-dir "$HOME/.local/share/codex-proxy" \
         -- \

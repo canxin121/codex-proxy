@@ -27,7 +27,7 @@ Install a specific release tag:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh \
-  | bash -s -- --version v0.1.2 -- \
+  | bash -s -- --version v0.1.3 -- \
       --bind 127.0.0.1:8787 \
       --data-dir "$HOME/.local/share/codex-proxy/data" \
       --admin-password 'change-me'
@@ -100,14 +100,14 @@ Update to a specific release tag:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/update.sh \
-  | bash -s -- --version v0.1.2
+  | bash -s -- --version v0.1.3
 ```
 
 Replace the saved runtime args during update:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/update.sh \
-  | bash -s -- --version v0.1.2 -- \
+  | bash -s -- --version v0.1.3 -- \
       --bind 127.0.0.1:8787 \
       --data-dir "$HOME/.local/share/codex-proxy/data" \
       --admin-password 'new-password'
