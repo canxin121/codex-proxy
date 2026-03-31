@@ -6,6 +6,8 @@ use crate::entities::request_record;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_login::AuthDotJson;
+use codex_login::AuthMode as LoginAuthMode;
+use codex_login::TokenData;
 use sea_orm::FromQueryResult;
 use serde::Deserialize;
 use serde::Serialize;
@@ -98,6 +100,8 @@ pub struct AdminSessionView {
     pub api_key_id: Option<String>,
     #[serde(rename = "api_key_name")]
     pub api_key_name: Option<String>,
+    #[serde(rename = "console_refresh_interval_seconds")]
+    pub console_refresh_interval_seconds: i32,
     #[serde(rename = "admin_session_created_at")]
     pub created_at: Option<DateTime<Utc>>,
     #[serde(rename = "admin_session_last_used_at")]
@@ -117,8 +121,38 @@ pub struct AdminLoginResponse {
 #[derive(Debug, Deserialize, Default)]
 pub struct CreateCredentialRequest {}
 
-pub type ExportCredentialJsonResponse = AuthDotJson;
-pub type ImportCredentialJsonRequest = AuthDotJson;
+#[derive(Debug, Serialize)]
+pub struct ExportCredentialJsonResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<LoginAuthMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<TokenData>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refresh: Option<DateTime<Utc>>,
+    #[serde(rename = "chatgpt_account_email")]
+    pub account_email: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportCredentialJsonRequest {
+    #[serde(default)]
+    pub auth_mode: Option<LoginAuthMode>,
+    #[serde(default)]
+    pub tokens: Option<TokenData>,
+    #[serde(default)]
+    pub last_refresh: Option<DateTime<Utc>>,
+}
+
+impl ImportCredentialJsonRequest {
+    pub fn into_auth_dot_json(self) -> AuthDotJson {
+        AuthDotJson {
+            auth_mode: self.auth_mode,
+            openai_api_key: None,
+            tokens: self.tokens,
+            last_refresh: self.last_refresh,
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Default, Clone, Copy)]
 pub struct PaginationQuery {

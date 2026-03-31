@@ -200,8 +200,8 @@ async function copySecret() {
 
 useAutoRefresh(
   load,
-  computed(() => session.hasAdminSession && session.autoRefresh),
-  computed(() => session.pollIntervalSeconds * 1000),
+  computed(() => session.hasAdminSession),
+  computed(() => session.refreshIntervalSeconds * 1000),
 )
 
 onMounted(() => {

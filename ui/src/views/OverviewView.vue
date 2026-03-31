@@ -17,8 +17,8 @@ import {
 import { RefreshOutline } from '@vicons/ionicons5'
 import BreakdownList from '@/components/BreakdownList.vue'
 import MetricCard from '@/components/MetricCard.vue'
+import MultiTrendChart from '@/components/MultiTrendChart.vue'
 import TokenUsageStrip from '@/components/TokenUsageStrip.vue'
-import TrendAreaChart from '@/components/TrendAreaChart.vue'
 import { api } from '@/api/service'
 import type {
   ApiKeyView,
@@ -65,33 +65,61 @@ const successRate = computed(() => {
   return formatPercent((current.success_request_count / current.total_request_count) * 100)
 })
 
-const dailyRequestSeries = computed(() =>
-  (usage.value?.daily ?? []).slice(-14).map((item) => ({
-    label: item.bucket.slice(5),
-    value: item.total_request_count,
-  })),
-)
-
-const hourlyRequestSeries = computed(() =>
-  (usage.value?.hourly ?? []).map((item) => ({
-    label: item.bucket,
-    value: item.total_request_count,
-  })),
-)
-
-const dailyTokenSeries = computed(() =>
-  (usage.value?.daily ?? []).slice(-14).map((item) => ({
-    label: item.bucket.slice(5),
-    value: item.token_usage.all_tokens,
-  })),
-)
-
-const hourlyTokenSeries = computed(() =>
-  (usage.value?.hourly ?? []).map((item) => ({
-    label: item.bucket,
-    value: item.token_usage.all_tokens,
-  })),
-)
+const dailyTokenTrendSeries = computed(() => {
+  const daily = (usage.value?.daily ?? []).slice(-14)
+  return [
+    {
+      key: 'all',
+      name: '总 Token',
+      color: '#0f6a58',
+      compact: true,
+      points: daily.map((item) => ({
+        label: item.bucket.slice(5),
+        value: item.token_usage.all_tokens,
+      })),
+    },
+    {
+      key: 'input',
+      name: '输入',
+      color: '#1f7c57',
+      compact: true,
+      points: daily.map((item) => ({
+        label: item.bucket.slice(5),
+        value: item.token_usage.read_input_tokens,
+      })),
+    },
+    {
+      key: 'cache',
+      name: '缓存',
+      color: '#ad6b1f',
+      compact: true,
+      points: daily.map((item) => ({
+        label: item.bucket.slice(5),
+        value: item.token_usage.cache_read_input_tokens,
+      })),
+    },
+    {
+      key: 'output',
+      name: '输出',
+      color: '#b4493f',
+      compact: true,
+      points: daily.map((item) => ({
+        label: item.bucket.slice(5),
+        value: item.token_usage.write_output_tokens,
+      })),
+    },
+    {
+      key: 'reasoning',
+      name: '思考',
+      color: '#7f5ca8',
+      compact: true,
+      points: daily.map((item) => ({
+        label: item.bucket.slice(5),
+        value: item.token_usage.write_reasoning_tokens,
+      })),
+    },
+  ]
+})
 
 function credentialDescription(credentialId: string) {
   const meta = credentialMap.value.get(credentialId)
@@ -181,8 +209,8 @@ async function load() {
 
 useAutoRefresh(
   load,
-  computed(() => session.hasAdminSession && session.autoRefresh),
-  computed(() => session.pollIntervalSeconds * 1000),
+  computed(() => session.hasAdminSession),
+  computed(() => session.refreshIntervalSeconds * 1000),
 )
 
 onMounted(() => {
@@ -268,60 +296,17 @@ onMounted(() => {
         <token-usage-strip :usage="usage.summary.token_usage" />
       </n-card>
 
-      <n-grid cols="1 xl:2" responsive="screen" :x-gap="18" :y-gap="18">
-        <n-grid-item>
-          <n-card class="section-card app-shell-card" :bordered="false">
-            <template #header>
-              <div class="section-headline">
-                <div>
-                  <div class="section-title">按天请求趋势</div>
-                  <div class="section-note">最近 14 个自然日的请求量</div>
-                </div>
-              </div>
-            </template>
-            <trend-area-chart :items="dailyRequestSeries" />
-          </n-card>
-        </n-grid-item>
-        <n-grid-item>
-          <n-card class="section-card app-shell-card" :bordered="false">
-            <template #header>
-              <div class="section-headline">
-                <div>
-                  <div class="section-title">全天时段请求分布</div>
-                  <div class="section-note">把全量请求压到 24 个小时刻度里看峰谷</div>
-                </div>
-              </div>
-            </template>
-            <trend-area-chart :items="hourlyRequestSeries" stroke="#ad6b1f" />
-          </n-card>
-        </n-grid-item>
-        <n-grid-item>
-          <n-card class="section-card app-shell-card" :bordered="false">
-            <template #header>
-              <div class="section-headline">
-                <div>
-                  <div class="section-title">按天 Token 趋势</div>
-                  <div class="section-note">最近 14 个自然日的 token 消耗</div>
-                </div>
-              </div>
-            </template>
-            <trend-area-chart :items="dailyTokenSeries" compact stroke="#0f6a58" />
-          </n-card>
-        </n-grid-item>
-        <n-grid-item>
-          <n-card class="section-card app-shell-card" :bordered="false">
-            <template #header>
-              <div class="section-headline">
-                <div>
-                  <div class="section-title">全天时段 Token 分布</div>
-                  <div class="section-note">观察哪个时段最吃 token</div>
-                </div>
-              </div>
-            </template>
-            <trend-area-chart :items="hourlyTokenSeries" compact stroke="#b4493f" />
-          </n-card>
-        </n-grid-item>
-      </n-grid>
+      <n-card class="section-card app-shell-card" :bordered="false">
+        <template #header>
+          <div class="section-headline">
+            <div>
+              <div class="section-title">Token 趋势（多曲线）</div>
+              <div class="section-note">最近 14 个自然日，合并展示输入、缓存、输出、思考与总量</div>
+            </div>
+          </div>
+        </template>
+        <multi-trend-chart :series="dailyTokenTrendSeries" />
+      </n-card>
 
       <n-grid cols="1 xl:2" responsive="screen" :x-gap="18" :y-gap="18">
         <n-grid-item>

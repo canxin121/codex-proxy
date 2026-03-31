@@ -73,7 +73,6 @@ const filteredSessions = computed(() => {
   })
 })
 
-const hasPendingSession = computed(() => sessions.value.some((item) => item.auth_status === 'pending'))
 const credentialOptions = computed(() =>
   credentials.value.map((item) => ({
     label: item.credential_name,
@@ -176,8 +175,8 @@ async function completeBrowserAuthFromCallbackUrl() {
 
 useAutoRefresh(
   load,
-  computed(() => session.hasAdminSession && (session.autoRefresh || hasPendingSession.value)),
-  computed(() => session.pollIntervalSeconds * 1000),
+  computed(() => session.hasAdminSession),
+  computed(() => session.refreshIntervalSeconds * 1000),
 )
 
 onMounted(() => {

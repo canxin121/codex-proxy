@@ -7,15 +7,10 @@ import {
   NForm,
   NFormItem,
   NInput,
-  NInputNumber,
-  NSpace,
-  NSwitch,
 } from 'naive-ui'
 
 const props = defineProps<{
   baseUrl: string
-  autoRefresh: boolean
-  pollIntervalSeconds: number
   submitting?: boolean
   errorMessage?: string
 }>()
@@ -25,8 +20,6 @@ const emit = defineEmits<{
     {
       baseUrl: string
       adminPassword: string
-      autoRefresh: boolean
-      pollIntervalSeconds: number
     },
   ]
 }>()
@@ -34,16 +27,12 @@ const emit = defineEmits<{
 const form = reactive({
   baseUrl: props.baseUrl,
   adminPassword: '',
-  autoRefresh: props.autoRefresh,
-  pollIntervalSeconds: props.pollIntervalSeconds,
 })
 
 watch(
   () => props,
   (value) => {
     form.baseUrl = value.baseUrl
-    form.autoRefresh = value.autoRefresh
-    form.pollIntervalSeconds = value.pollIntervalSeconds
   },
   { deep: true },
 )
@@ -52,8 +41,6 @@ function handleSubmit() {
   emit('submit', {
     baseUrl: form.baseUrl.trim(),
     adminPassword: form.adminPassword,
-    autoRefresh: form.autoRefresh,
-    pollIntervalSeconds: form.pollIntervalSeconds,
   })
 }
 </script>
@@ -93,19 +80,6 @@ function handleSubmit() {
             placeholder="启动服务时传入的密码"
           />
         </n-form-item>
-        <n-space size="large" wrap>
-          <n-form-item label="自动刷新">
-            <n-switch v-model:value="form.autoRefresh" />
-          </n-form-item>
-          <n-form-item label="刷新间隔（秒）">
-            <n-input-number
-              v-model:value="form.pollIntervalSeconds"
-              :min="5"
-              :max="120"
-              :precision="0"
-            />
-          </n-form-item>
-        </n-space>
         <n-button
           type="primary"
           size="large"

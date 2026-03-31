@@ -157,6 +157,10 @@ Proxy routes require either the admin token or a generated proxy API key.
 - `request_stats`
 - `last_request_error`
 
+`POST /admin/session/login` and `GET /admin/session` include:
+
+- `console_refresh_interval_seconds` (backend-fixed frontend polling interval)
+
 List routes support `limit` and `offset`:
 
 - `GET /admin/credentials`
@@ -203,6 +207,11 @@ Export an existing credential auth payload:
 GET /admin/credentials/:id/export-json
 ```
 
+Export response keeps `auth.json` fields and also includes:
+
+- `chatgpt_account_email` (if available)
+- does **not** include `OPENAI_API_KEY`
+
 Import from JSON (`auth.json` payload only):
 
 ```json
@@ -217,6 +226,8 @@ POST /admin/credentials/import-json
   }
 }
 ```
+
+`OPENAI_API_KEY` is ignored for credential import and never persisted through this endpoint.
 
 ## Browser auth flow
 

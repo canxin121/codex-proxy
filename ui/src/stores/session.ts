@@ -2,12 +2,12 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 
 const STORAGE_KEY = 'codex-proxy-console.session'
+const FALLBACK_REFRESH_INTERVAL_SECONDS = 15
 
 interface StoredSession {
   baseUrl: string
   adminSessionToken: string
-  autoRefresh: boolean
-  pollIntervalSeconds: number
+  refreshIntervalSeconds: number
 }
 
 function defaultBaseUrl() {
@@ -20,25 +20,26 @@ function readStoredSession(): StoredSession {
     return {
       baseUrl: defaultBaseUrl(),
       adminSessionToken: '',
-      autoRefresh: true,
-      pollIntervalSeconds: 15,
+      refreshIntervalSeconds: FALLBACK_REFRESH_INTERVAL_SECONDS,
     }
   }
 
   try {
-    const parsed = JSON.parse(raw) as Partial<StoredSession>
+    const parsed = JSON.parse(raw) as Partial<StoredSession> & {
+      pollIntervalSeconds?: number
+    }
+    const savedRefreshInterval =
+      parsed.refreshIntervalSeconds ?? parsed.pollIntervalSeconds ?? FALLBACK_REFRESH_INTERVAL_SECONDS
     return {
       baseUrl: parsed.baseUrl?.trim() || defaultBaseUrl(),
       adminSessionToken: parsed.adminSessionToken?.trim() || '',
-      autoRefresh: parsed.autoRefresh ?? true,
-      pollIntervalSeconds: Math.max(5, Math.min(parsed.pollIntervalSeconds ?? 15, 120)),
+      refreshIntervalSeconds: Math.max(5, Math.min(savedRefreshInterval, 120)),
     }
   } catch {
     return {
       baseUrl: defaultBaseUrl(),
       adminSessionToken: '',
-      autoRefresh: true,
-      pollIntervalSeconds: 15,
+      refreshIntervalSeconds: FALLBACK_REFRESH_INTERVAL_SECONDS,
     }
   }
 }
@@ -47,8 +48,7 @@ export const useSessionStore = defineStore('session', () => {
   const stored = readStoredSession()
   const baseUrl = ref(stored.baseUrl)
   const adminSessionToken = ref(stored.adminSessionToken)
-  const autoRefresh = ref(stored.autoRefresh)
-  const pollIntervalSeconds = ref(stored.pollIntervalSeconds)
+  const refreshIntervalSeconds = ref(stored.refreshIntervalSeconds)
 
   const hasAdminSession = computed(() => adminSessionToken.value.trim().length > 0)
   const apiContext = computed(() => ({
@@ -60,8 +60,7 @@ export const useSessionStore = defineStore('session', () => {
     const payload: StoredSession = {
       baseUrl: baseUrl.value.trim() || defaultBaseUrl(),
       adminSessionToken: adminSessionToken.value.trim(),
-      autoRefresh: autoRefresh.value,
-      pollIntervalSeconds: Math.max(5, Math.min(pollIntervalSeconds.value, 120)),
+      refreshIntervalSeconds: Math.max(5, Math.min(refreshIntervalSeconds.value, 120)),
     }
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
   }
@@ -73,11 +72,8 @@ export const useSessionStore = defineStore('session', () => {
     if (patch.adminSessionToken !== undefined) {
       adminSessionToken.value = patch.adminSessionToken
     }
-    if (patch.autoRefresh !== undefined) {
-      autoRefresh.value = patch.autoRefresh
-    }
-    if (patch.pollIntervalSeconds !== undefined) {
-      pollIntervalSeconds.value = patch.pollIntervalSeconds
+    if (patch.refreshIntervalSeconds !== undefined) {
+      refreshIntervalSeconds.value = Math.max(5, Math.min(patch.refreshIntervalSeconds, 120))
     }
     persist()
   }
@@ -90,12 +86,11 @@ export const useSessionStore = defineStore('session', () => {
   return {
     adminSessionToken,
     apiContext,
-    autoRefresh,
     baseUrl,
     clearAdminSession,
     hasAdminSession,
     persist,
-    pollIntervalSeconds,
+    refreshIntervalSeconds,
     updateSession,
   }
 })

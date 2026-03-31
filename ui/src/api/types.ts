@@ -18,6 +18,7 @@ export interface AdminSessionView {
   principal_kind: 'admin_session' | 'api_key'
   api_key_id: string | null
   api_key_name: string | null
+  console_refresh_interval_seconds: number
   admin_session_created_at: string | null
   admin_session_last_used_at: string | null
   admin_session_expires_at: string | null
@@ -243,7 +244,9 @@ export interface CreateCredentialPayload {}
 
 export type ImportCredentialJsonPayload = Record<string, unknown>
 
-export type ExportCredentialJsonResponse = Record<string, unknown>
+export type ExportCredentialJsonResponse = {
+  chatgpt_account_email: string | null
+} & Record<string, unknown>
 
 export interface UpdateCredentialPayload {
   credential_name?: string

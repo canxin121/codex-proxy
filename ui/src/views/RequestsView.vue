@@ -20,8 +20,8 @@ import {
 import { EyeOutline, RefreshOutline } from '@vicons/ionicons5'
 import BreakdownList from '@/components/BreakdownList.vue'
 import MetricCard from '@/components/MetricCard.vue'
+import MultiTrendChart from '@/components/MultiTrendChart.vue'
 import TokenUsageStrip from '@/components/TokenUsageStrip.vue'
-import TrendAreaChart from '@/components/TrendAreaChart.vue'
 import { api } from '@/api/service'
 import type { ApiKeyView, CredentialView, RequestBreakdownView, RequestRecordView, UsageStatsView } from '@/api/types'
 import { useSessionStore } from '@/stores/session'
@@ -97,19 +97,61 @@ const maxDuration = computed(() => {
   return formatDurationMs(value)
 })
 
-const dailyRequestSeries = computed(() =>
-  (usage.value?.daily ?? []).slice(-14).map((item) => ({
-    label: item.bucket.slice(5),
-    value: item.total_request_count,
-  })),
-)
-
-const dailyTokenSeries = computed(() =>
-  (usage.value?.daily ?? []).slice(-14).map((item) => ({
-    label: item.bucket.slice(5),
-    value: item.token_usage.all_tokens,
-  })),
-)
+const dailyTokenTrendSeries = computed(() => {
+  const daily = (usage.value?.daily ?? []).slice(-14)
+  return [
+    {
+      key: 'all',
+      name: '总 Token',
+      color: '#0f6a58',
+      compact: true,
+      points: daily.map((item) => ({
+        label: item.bucket.slice(5),
+        value: item.token_usage.all_tokens,
+      })),
+    },
+    {
+      key: 'input',
+      name: '输入',
+      color: '#1f7c57',
+      compact: true,
+      points: daily.map((item) => ({
+        label: item.bucket.slice(5),
+        value: item.token_usage.read_input_tokens,
+      })),
+    },
+    {
+      key: 'cache',
+      name: '缓存',
+      color: '#ad6b1f',
+      compact: true,
+      points: daily.map((item) => ({
+        label: item.bucket.slice(5),
+        value: item.token_usage.cache_read_input_tokens,
+      })),
+    },
+    {
+      key: 'output',
+      name: '输出',
+      color: '#b4493f',
+      compact: true,
+      points: daily.map((item) => ({
+        label: item.bucket.slice(5),
+        value: item.token_usage.write_output_tokens,
+      })),
+    },
+    {
+      key: 'reasoning',
+      name: '思考',
+      color: '#7f5ca8',
+      compact: true,
+      points: daily.map((item) => ({
+        label: item.bucket.slice(5),
+        value: item.token_usage.write_reasoning_tokens,
+      })),
+    },
+  ]
+})
 
 const topModels = computed<BreakdownListItem[]>(() =>
   (usage.value?.models ?? []).slice(0, 6).map((item) => ({
@@ -201,8 +243,8 @@ function handlePageSizeChange(nextPageSize: number) {
 
 useAutoRefresh(
   load,
-  computed(() => session.hasAdminSession && session.autoRefresh),
-  computed(() => session.pollIntervalSeconds * 1000),
+  computed(() => session.hasAdminSession),
+  computed(() => session.refreshIntervalSeconds * 1000),
 )
 
 onMounted(() => {
@@ -309,18 +351,17 @@ onMounted(() => {
         <token-usage-strip :usage="usage.summary.token_usage" />
       </n-card>
 
-      <n-grid cols="1 xl:2" responsive="screen" :x-gap="18" :y-gap="18">
-        <n-grid-item>
-          <n-card class="section-card app-shell-card" :bordered="false" title="按天请求趋势">
-            <trend-area-chart :items="dailyRequestSeries" />
-          </n-card>
-        </n-grid-item>
-        <n-grid-item>
-          <n-card class="section-card app-shell-card" :bordered="false" title="按天 Token 趋势">
-            <trend-area-chart :items="dailyTokenSeries" compact stroke="#b4493f" />
-          </n-card>
-        </n-grid-item>
-      </n-grid>
+      <n-card class="section-card app-shell-card" :bordered="false">
+        <template #header>
+          <div class="section-headline">
+            <div>
+              <div class="section-title">按天 Token 趋势（多曲线）</div>
+              <div class="section-note">当前筛选范围最近 14 天，合并展示输入、缓存、输出、思考与总量</div>
+            </div>
+          </div>
+        </template>
+        <multi-trend-chart :series="dailyTokenTrendSeries" />
+      </n-card>
 
       <n-grid cols="1 xl:2" responsive="screen" :x-gap="18" :y-gap="18">
         <n-grid-item>

@@ -156,6 +156,7 @@ struct ActiveWebsocketRequest {
 
 const DEFAULT_LIST_LIMIT: u64 = 20;
 const MAX_LIST_LIMIT: u64 = 200;
+const CONSOLE_REFRESH_INTERVAL_SECONDS: i32 = 15;
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
@@ -249,6 +250,7 @@ async fn login_admin_session(
             principal_kind: "admin_session".to_string(),
             api_key_id: None,
             api_key_name: None,
+            console_refresh_interval_seconds: CONSOLE_REFRESH_INTERVAL_SECONDS,
             created_at: Some(created.created_at),
             last_used_at: Some(created.last_used_at),
             expires_at: Some(created.expires_at),
@@ -369,6 +371,7 @@ async fn import_credential_json(
     Json(payload): Json<ImportCredentialJsonRequest>,
 ) -> Result<(StatusCode, Json<CredentialView>), AppError> {
     require_admin(&state, &headers).await?;
+    let payload = payload.into_auth_dot_json();
     validate_imported_auth_json(&payload)?;
 
     let now = Utc::now();
@@ -441,7 +444,18 @@ async fn export_credential_json(
     .map_err(|err| AppError::internal(err.to_string()))?
     .ok_or_else(|| AppError::not_found("credential auth is not available"))?;
 
-    Ok(Json(auth_json))
+    let account_email = model.account_email.clone().or_else(|| {
+        auth_json
+            .tokens
+            .as_ref()
+            .and_then(|tokens| tokens.id_token.email.clone())
+    });
+    Ok(Json(ExportCredentialJsonResponse {
+        auth_mode: auth_json.auth_mode,
+        tokens: auth_json.tokens,
+        last_refresh: auth_json.last_refresh,
+        account_email,
+    }))
 }
 
 async fn update_credential(
@@ -2311,6 +2325,7 @@ fn admin_session_view(principal: &AuthenticatedPrincipal) -> AdminSessionView {
         principal_kind: principal.principal_kind.as_str().to_string(),
         api_key_id: principal.api_key_id.clone(),
         api_key_name: principal.api_key_name.clone(),
+        console_refresh_interval_seconds: CONSOLE_REFRESH_INTERVAL_SECONDS,
         created_at: principal.admin_session_created_at,
         last_used_at: principal.admin_session_last_used_at,
         expires_at: principal.admin_session_expires_at,

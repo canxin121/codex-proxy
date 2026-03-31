@@ -21,7 +21,6 @@ import {
   NGlobalStyle,
   NIcon,
   NInput,
-  NInputNumber,
   NLayout,
   NLayoutContent,
   NLayoutHeader,
@@ -30,7 +29,6 @@ import {
   NMessageProvider,
   NNotificationProvider,
   NSpace,
-  NSwitch,
   NTag,
 } from 'naive-ui'
 import type { MenuOption } from 'naive-ui'
@@ -54,16 +52,12 @@ const loginError = ref('')
 
 const settingsForm = reactive({
   baseUrl: session.baseUrl,
-  autoRefresh: session.autoRefresh,
-  pollIntervalSeconds: session.pollIntervalSeconds,
 })
 
 watch(
-  () => [session.baseUrl, session.adminSessionToken, session.autoRefresh, session.pollIntervalSeconds] as const,
-  ([baseUrl, _adminSessionToken, autoRefresh, pollIntervalSeconds]) => {
+  () => [session.baseUrl, session.adminSessionToken] as const,
+  ([baseUrl]) => {
     settingsForm.baseUrl = baseUrl
-    settingsForm.autoRefresh = autoRefresh
-    settingsForm.pollIntervalSeconds = pollIntervalSeconds
   },
 )
 
@@ -121,8 +115,6 @@ function renderIcon(icon: object) {
 async function handleLogin(payload: {
   baseUrl: string
   adminPassword: string
-  autoRefresh: boolean
-  pollIntervalSeconds: number
 }) {
   connecting.value = true
   loginError.value = ''
@@ -140,16 +132,13 @@ async function handleLogin(payload: {
     session.updateSession({
       baseUrl,
       adminSessionToken: response.admin_session_token,
-      autoRefresh: payload.autoRefresh,
-      pollIntervalSeconds: payload.pollIntervalSeconds,
+      refreshIntervalSeconds: response.admin_session.console_refresh_interval_seconds,
     })
     await verifyAdminSession()
   } catch (error) {
     session.updateSession({
       baseUrl: payload.baseUrl.trim(),
       adminSessionToken: '',
-      autoRefresh: payload.autoRefresh,
-      pollIntervalSeconds: payload.pollIntervalSeconds,
     })
     serviceHealthy.value = null
     loginError.value = error instanceof ApiError ? error.message : String(error)
@@ -164,8 +153,6 @@ function applySettings() {
   session.updateSession({
     baseUrl: nextBaseUrl,
     adminSessionToken: baseUrlChanged ? '' : session.adminSessionToken,
-    autoRefresh: settingsForm.autoRefresh,
-    pollIntervalSeconds: settingsForm.pollIntervalSeconds,
   })
   if (baseUrlChanged) {
     serviceHealthy.value = null
@@ -182,7 +169,10 @@ async function verifyAdminSession() {
     return
   }
   try {
-    await api.getAdminSession(session.apiContext)
+    const response = await api.getAdminSession(session.apiContext)
+    session.updateSession({
+      refreshIntervalSeconds: response.console_refresh_interval_seconds,
+    })
     serviceHealthy.value = true
     lastHealthError.value = ''
     loginError.value = ''
@@ -219,8 +209,8 @@ async function handleLogout() {
 
 useAutoRefresh(
   verifyAdminSession,
-  computed(() => session.hasAdminSession && session.autoRefresh),
-  computed(() => session.pollIntervalSeconds * 1000),
+  computed(() => session.hasAdminSession),
+  computed(() => session.refreshIntervalSeconds * 1000),
 )
 
 onMounted(() => {
@@ -236,10 +226,8 @@ onMounted(() => {
         <n-message-provider>
           <admin-gate
             v-if="!session.hasAdminSession"
-            :auto-refresh="session.autoRefresh"
             :base-url="session.baseUrl"
             :error-message="loginError"
-            :poll-interval-seconds="session.pollIntervalSeconds"
             :submitting="connecting"
             @submit="handleLogin"
           />
@@ -299,7 +287,7 @@ onMounted(() => {
                       {{ serviceHealthy === false ? '后端异常' : serviceHealthy ? '后端在线' : '未检测' }}
                     </n-tag>
                     <n-tag round type="info">
-                      {{ session.autoRefresh ? `${session.pollIntervalSeconds}s 自动刷新` : '手动刷新' }}
+                      {{ `${session.refreshIntervalSeconds}s 自动刷新` }}
                     </n-tag>
                     <n-space :size="8">
                       <n-button quaternary @click="showSettings = true">
@@ -340,19 +328,6 @@ onMounted(() => {
                   <n-form-item label="后端地址">
                     <n-input v-model:value="settingsForm.baseUrl" />
                   </n-form-item>
-                  <n-space size="large" vertical>
-                    <n-form-item label="自动刷新">
-                      <n-switch v-model:value="settingsForm.autoRefresh" />
-                    </n-form-item>
-                    <n-form-item label="刷新间隔（秒）">
-                      <n-input-number
-                        v-model:value="settingsForm.pollIntervalSeconds"
-                        :min="5"
-                        :max="120"
-                        :precision="0"
-                      />
-                    </n-form-item>
-                  </n-space>
                   <p v-if="lastHealthError" class="settings-error">
                     {{ lastHealthError }}
                   </p>
