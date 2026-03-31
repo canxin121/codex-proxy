@@ -30,20 +30,67 @@ const chartWidth = viewBoxWidth - chartLeft - chartRight
 const chartHeight = viewBoxHeight - chartTop - chartBottom
 const chartBaselineY = chartTop + chartHeight
 const hoveredIndex = ref<number | null>(null)
+const visibleSeriesKeys = ref<string[]>([])
 
-const activeSeries = computed(() => props.series.filter((item) => item.points.length > 0))
-const labels = computed(() => activeSeries.value[0]?.points.map((item) => item.label) ?? [])
+const seriesWithPoints = computed(() => props.series.filter((item) => item.points.length > 0))
+const labels = computed(() => seriesWithPoints.value[0]?.points.map((item) => item.label) ?? [])
 const pointCount = computed(() => labels.value.length)
+
+watch(
+  () => seriesWithPoints.value.map((series) => series.key),
+  (keys) => {
+    if (!keys.length) {
+      visibleSeriesKeys.value = []
+      hoveredIndex.value = null
+      return
+    }
+
+    if (!visibleSeriesKeys.value.length) {
+      visibleSeriesKeys.value = [...keys]
+      return
+    }
+
+    const availableKeys = new Set(keys)
+    const nextVisibleKeys = visibleSeriesKeys.value.filter((key) => availableKeys.has(key))
+    visibleSeriesKeys.value = nextVisibleKeys.length ? nextVisibleKeys : [...keys]
+  },
+  { immediate: true },
+)
+
+watch(
+  pointCount,
+  (count) => {
+    if (count <= 0 || (hoveredIndex.value !== null && hoveredIndex.value >= count)) {
+      hoveredIndex.value = null
+    }
+  },
+  { immediate: true },
+)
+
+const summarySeries = computed(() =>
+  seriesWithPoints.value.map((series) => ({
+    ...series,
+    lastValue: series.points[series.points.length - 1]?.value ?? 0,
+    peakValue: Math.max(...series.points.map((point) => point.value), 0),
+    visible: visibleSeriesKeys.value.includes(series.key),
+  })),
+)
+
+const visibleSeries = computed(() =>
+  summarySeries.value.filter((series) => visibleSeriesKeys.value.includes(series.key)),
+)
+
 const axisUsesCompactFormat = computed(
-  () => activeSeries.value.length > 0 && activeSeries.value.every((series) => Boolean(series.compact)),
+  () => visibleSeries.value.length > 0 && visibleSeries.value.every((series) => Boolean(series.compact)),
 )
 
 const maxValue = computed(() =>
   Math.max(
-    ...activeSeries.value.flatMap((item) => item.points.map((point) => point.value)),
+    ...visibleSeries.value.flatMap((item) => item.points.map((point) => point.value)),
     0,
   ),
 )
+
 const valueSpan = computed(() => Math.max(maxValue.value, 1))
 
 function smoothPath(dataset: Array<{ x: number; y: number }>, tension = 0.86): string {
@@ -74,7 +121,7 @@ function smoothPath(dataset: Array<{ x: number; y: number }>, tension = 0.86): s
 
 const projectedSeries = computed(() => {
   const denominator = Math.max(pointCount.value - 1, 1)
-  return activeSeries.value.map((series) => {
+  return visibleSeries.value.map((series) => {
     const points = labels.value.map((label, index) => {
       const source = series.points[index]
       const value = source?.value ?? 0
@@ -92,32 +139,13 @@ const projectedSeries = computed(() => {
       ...series,
       points,
       linePath: smoothPath(points),
-      lastValue: points[points.length - 1]?.value ?? 0,
-      peakValue: Math.max(...points.map((item) => item.value), 0),
     }
   })
 })
 
-watch(
-  pointCount,
-  (count) => {
-    if (count <= 0) {
-      hoveredIndex.value = null
-      return
-    }
-    if (hoveredIndex.value === null || hoveredIndex.value >= count) {
-      hoveredIndex.value = count - 1
-    }
-  },
-  { immediate: true },
-)
-
 const activeIndex = computed(() => {
-  if (pointCount.value <= 0) {
+  if (pointCount.value <= 0 || hoveredIndex.value === null) {
     return null
-  }
-  if (hoveredIndex.value === null) {
-    return pointCount.value - 1
   }
   return Math.min(Math.max(hoveredIndex.value, 0), pointCount.value - 1)
 })
@@ -156,16 +184,11 @@ const activeTooltipRows = computed(() => {
 const activePointPercent = computed(() => {
   const x = activeX.value
   const index = activeIndex.value
-  if (x === null || !activeTooltipRows.value.length) {
+  if (x === null || index === null || !activeTooltipRows.value.length) {
     return null
   }
   const minY = Math.min(
-    ...projectedSeries.value.map((series) => {
-      if (index === null) {
-        return chartBaselineY
-      }
-      return series.points[index]?.y ?? chartBaselineY
-    }),
+    ...projectedSeries.value.map((series) => series.points[index]?.y ?? chartBaselineY),
   )
   return {
     left: (x / viewBoxWidth) * 100,
@@ -209,6 +232,40 @@ const gridLines = computed(() => {
     return {
       y,
       value,
+    }
+  })
+})
+
+const hoverZones = computed(() => {
+  if (!pointCount.value) {
+    return []
+  }
+  if (pointCount.value === 1) {
+    return [
+      {
+        index: 0,
+        x: chartLeft,
+        width: chartWidth,
+      },
+    ]
+  }
+
+  return Array.from({ length: pointCount.value }, (_, index) => {
+    const x = chartLeft + (chartWidth * index) / (pointCount.value - 1)
+    const prevX = index === 0
+      ? chartLeft
+      : chartLeft + (chartWidth * (index - 1)) / (pointCount.value - 1)
+    const nextX = index === pointCount.value - 1
+      ? chartLeft + chartWidth
+      : chartLeft + (chartWidth * (index + 1)) / (pointCount.value - 1)
+
+    const left = index === 0 ? chartLeft : (prevX + x) / 2
+    const right = index === pointCount.value - 1 ? chartLeft + chartWidth : (x + nextX) / 2
+
+    return {
+      index,
+      x: left,
+      width: right - left,
     }
   })
 })
@@ -259,22 +316,42 @@ function formatAxisValue(value: number) {
 function setHoveredIndex(index: number | null) {
   hoveredIndex.value = index
 }
+
+function toggleSeries(key: string) {
+  const isVisible = visibleSeriesKeys.value.includes(key)
+  if (isVisible && visibleSeriesKeys.value.length === 1) {
+    return
+  }
+  visibleSeriesKeys.value = isVisible
+    ? visibleSeriesKeys.value.filter((item) => item !== key)
+    : [...visibleSeriesKeys.value, key]
+}
 </script>
 
 <template>
-  <div v-if="!projectedSeries.length || !pointCount" class="chart-empty">
+  <div v-if="!summarySeries.length || !pointCount" class="chart-empty">
     {{ emptyText ?? '暂无趋势数据' }}
   </div>
   <div v-else class="chart-shell">
     <div class="chart-summary">
-      <div v-for="series in projectedSeries" :key="`summary-${series.key}`">
-        <span>{{ series.name }} · 峰值</span>
+      <button
+        v-for="series in summarySeries"
+        :key="`summary-${series.key}`"
+        type="button"
+        class="chart-summary__item"
+        :class="{ 'chart-summary__item--muted': !series.visible }"
+        @click="toggleSeries(series.key)"
+      >
+        <span class="chart-summary__title">
+          <span class="chart-summary__dot" :style="{ background: series.color }"></span>
+          {{ series.name }} · 峰值
+        </span>
         <strong :style="{ color: series.color }">{{ formatValue(series.peakValue, series.compact) }}</strong>
-        <small>最近 {{ formatValue(series.lastValue, series.compact) }}</small>
-      </div>
+        <small>{{ series.visible ? '点击隐藏曲线' : '点击显示曲线' }} · 最近 {{ formatValue(series.lastValue, series.compact) }}</small>
+      </button>
     </div>
 
-    <div class="chart-stage">
+    <div class="chart-stage" @mouseleave="setHoveredIndex(null)">
       <svg
         class="chart-svg"
         :viewBox="`0 0 ${viewBoxWidth} ${viewBoxHeight}`"
@@ -299,6 +376,19 @@ function setHoveredIndex(index: number | null) {
               {{ formatAxisValue(Math.max(0, line.value)) }}
             </text>
           </g>
+        </g>
+
+        <g>
+          <rect
+            v-for="zone in hoverZones"
+            :key="`hover-${zone.index}`"
+            :x="zone.x"
+            :y="chartTop"
+            :width="zone.width"
+            :height="chartHeight"
+            fill="transparent"
+            @mouseenter="setHoveredIndex(zone.index)"
+          />
         </g>
 
         <line
@@ -332,7 +422,6 @@ function setHoveredIndex(index: number | null) {
             fill="#fff"
             :stroke="series.color"
             stroke-width="2.2"
-            @mouseenter="setHoveredIndex(point.index)"
           />
         </g>
 
@@ -404,21 +493,44 @@ function setHoveredIndex(index: number | null) {
 
 .chart-summary {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 10px;
 }
 
-.chart-summary > div {
+.chart-summary__item {
+  appearance: none;
+  width: 100%;
   padding: 10px 12px;
   border: 1px solid rgba(20, 80, 68, 0.14);
   border-radius: 14px;
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.74), rgba(255, 250, 242, 0.74));
+  text-align: left;
+  cursor: pointer;
+  transition: opacity 0.18s ease, transform 0.18s ease, border-color 0.18s ease;
 }
 
-.chart-summary span {
+.chart-summary__item:hover {
+  transform: translateY(-1px);
+  border-color: rgba(20, 80, 68, 0.26);
+}
+
+.chart-summary__item--muted {
+  opacity: 0.48;
+}
+
+.chart-summary__title {
   display: block;
   color: var(--cp-text-soft);
   font-size: 12px;
+}
+
+.chart-summary__dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 6px;
+  border-radius: 999px;
+  vertical-align: middle;
 }
 
 .chart-summary strong {

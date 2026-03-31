@@ -889,27 +889,6 @@ fn assess_credential_quota(
             (Some(true), _) | (_, Some(true)) => {
                 has_available_credits = true;
             }
-            (Some(false), Some(false)) => {
-                remaining_percent = Some(match remaining_percent {
-                    Some(current) => current.min(0.0),
-                    None => 0.0,
-                });
-                match transient_quota_retry_at(limit.updated_at) {
-                    Some(retry_at) if retry_at > now => {
-                        available = false;
-                        next_retry_at = Some(match next_retry_at {
-                            Some(current) => current.max(retry_at),
-                            None => retry_at,
-                        });
-                    }
-                    Some(_) => {}
-                    None => {
-                        available = false;
-                        blocked_without_retry = true;
-                    }
-                }
-                continue;
-            }
             _ => {}
         }
 
@@ -1946,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn assess_credential_quota_blocks_when_credits_are_exhausted() {
+    fn assess_credential_quota_does_not_block_when_credit_tracking_is_unavailable() {
         let mut limit = limit_model();
         limit.has_credits = Some(false);
         limit.unlimited = Some(false);
@@ -1956,28 +1935,9 @@ mod tests {
         assert_eq!(
             assessment,
             CredentialQuotaAssessment {
-                available: false,
-                next_retry_at: Some(timestamp(1_700_000_300)),
-                remaining_percent: Some(0.0),
-                has_available_credits: false,
-            }
-        );
-    }
-
-    #[test]
-    fn assess_credential_quota_recovers_stale_credit_exhaustion_snapshot() {
-        let mut limit = limit_model();
-        limit.has_credits = Some(false);
-        limit.unlimited = Some(false);
-
-        let assessment = assess_credential_quota(&[limit], timestamp(1_700_000_301));
-
-        assert_eq!(
-            assessment,
-            CredentialQuotaAssessment {
                 available: true,
                 next_retry_at: None,
-                remaining_percent: Some(0.0),
+                remaining_percent: None,
                 has_available_credits: false,
             }
         );

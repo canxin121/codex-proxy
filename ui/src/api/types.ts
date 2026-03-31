@@ -48,6 +48,7 @@ export interface RequestStatsSummaryView {
   total_request_count: number
   success_request_count: number
   failure_request_count: number
+  pending_request_count: number
   http_request_count: number
   websocket_request_count: number
   first_request_at: string | null
@@ -67,6 +68,7 @@ export interface UsageTimeBucketView {
   total_request_count: number
   success_request_count: number
   failure_request_count: number
+  pending_request_count: number
   token_usage: RequestUsageTotalsView
 }
 
@@ -87,6 +89,8 @@ export interface UsageStatsFiltersView {
   api_key_id: string | null
   only_failures: boolean
   top: number
+  started_after: string | null
+  started_before: string | null
 }
 
 export interface UsageStatsView {
@@ -314,6 +318,8 @@ export interface RequestQuery {
   credential_id?: string
   api_key_id?: string
   only_failures?: boolean
+  started_after?: string
+  started_before?: string
 }
 
 export interface UsageQuery {
@@ -321,4 +327,6 @@ export interface UsageQuery {
   api_key_id?: string
   only_failures?: boolean
   top?: number
+  started_after?: string
+  started_before?: string
 }

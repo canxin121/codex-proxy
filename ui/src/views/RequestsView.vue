@@ -1,15 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import dayjs from 'dayjs'
 import {
   NButton,
   NCard,
+  NDatePicker,
   NDrawer,
   NDrawerContent,
   NEmpty,
   NGrid,
   NGridItem,
   NIcon,
-  NInputNumber,
   NPagination,
   NSelect,
   NSpace,
@@ -32,6 +33,11 @@ type BreakdownListItem = RequestBreakdownView & {
   description?: string
 }
 
+type TrendGranularity = 'day' | 'hour'
+type TimestampRangeValue = [number, number] | null
+
+const DEFAULT_RANGE_DAYS = 14
+
 const session = useSessionStore()
 
 const loading = ref(false)
@@ -43,10 +49,51 @@ const usage = ref<UsageStatsView | null>(null)
 const credentialFilter = ref<string | null>(null)
 const apiKeyFilter = ref<string | null>(null)
 const onlyFailures = ref(false)
+const timeRange = ref<TimestampRangeValue>(createRecentRange(DEFAULT_RANGE_DAYS))
+const trendGranularity = ref<TrendGranularity>('day')
 const page = ref(1)
 const pageSize = ref(100)
 const totalRecords = ref(0)
 const selectedRecord = ref<RequestRecordView | null>(null)
+
+const trendGranularityOptions = [
+  { label: '按天', value: 'day' },
+  { label: '按小时', value: 'hour' },
+]
+
+function createRecentRange(days: number): [number, number] {
+  const end = dayjs()
+  return [end.subtract(days, 'day').valueOf(), end.valueOf()]
+}
+
+function formatBucketLabel(bucket: string, granularity: TrendGranularity) {
+  if (!bucket || bucket === 'unknown') {
+    return bucket || 'unknown'
+  }
+  return granularity === 'hour'
+    ? bucket.slice(5, 16)
+    : bucket.slice(5)
+}
+
+function formatStatusLabel(success: boolean | null) {
+  if (success === true) {
+    return '成功'
+  }
+  if (success === false) {
+    return '失败'
+  }
+  return '进行中'
+}
+
+function statusTagType(success: boolean | null): 'success' | 'error' | 'warning' {
+  if (success === true) {
+    return 'success'
+  }
+  if (success === false) {
+    return 'error'
+  }
+  return 'warning'
+}
 
 const showDetailDrawer = computed({
   get: () => Boolean(selectedRecord.value),
@@ -73,12 +120,44 @@ const apiKeyOptions = computed(() =>
 
 const filterSummary = computed(() => usage.value?.summary ?? null)
 
-const failureRate = computed(() => {
+const startedAfter = computed(() =>
+  timeRange.value ? new Date(timeRange.value[0]).toISOString() : undefined,
+)
+
+const startedBefore = computed(() =>
+  timeRange.value ? new Date(timeRange.value[1]).toISOString() : undefined,
+)
+
+const completedRequestCount = computed(() => {
   const current = filterSummary.value
-  if (!current || current.total_request_count === 0) {
+  if (!current) {
+    return 0
+  }
+  return current.success_request_count + current.failure_request_count
+})
+
+const pendingRequestCount = computed(() => filterSummary.value?.pending_request_count ?? 0)
+
+const successRate = computed(() => {
+  const current = filterSummary.value
+  if (!current) {
     return '0%'
   }
-  return formatPercent((current.failure_request_count / current.total_request_count) * 100)
+  if (completedRequestCount.value === 0) {
+    return pendingRequestCount.value > 0 ? '未完成' : '0%'
+  }
+  return formatPercent((current.success_request_count / completedRequestCount.value) * 100)
+})
+
+const failureRate = computed(() => {
+  const current = filterSummary.value
+  if (!current) {
+    return '0%'
+  }
+  if (completedRequestCount.value === 0) {
+    return pendingRequestCount.value > 0 ? '未完成' : '0%'
+  }
+  return formatPercent((current.failure_request_count / completedRequestCount.value) * 100)
 })
 
 const averageDuration = computed(() => {
@@ -97,15 +176,46 @@ const maxDuration = computed(() => {
   return formatDurationMs(value)
 })
 
-const dailyRequestTrendSeries = computed(() => {
-  const daily = (usage.value?.daily ?? []).slice(-14)
-  return [
+const trendGranularityLabel = computed(() => trendGranularity.value === 'hour' ? '按小时' : '按天')
+
+const trendBuckets = computed(() =>
+  trendGranularity.value === 'hour'
+    ? (usage.value?.hourly ?? [])
+    : (usage.value?.daily ?? []),
+)
+
+const hasPendingTrend = computed(() => trendBuckets.value.some((item) => item.pending_request_count > 0))
+
+const timeRangeLabel = computed(() => {
+  if (!timeRange.value) {
+    return '全部时间'
+  }
+
+  const [start, end] = timeRange.value
+  const startTime = dayjs(start)
+  const endTime = dayjs(end)
+  const isRecentWindow = Math.abs(dayjs().diff(endTime, 'minute')) <= 5
+  const diffHours = endTime.diff(startTime, 'hour')
+  const diffDays = endTime.diff(startTime, 'day')
+
+  if (isRecentWindow && diffHours > 0 && diffHours <= 48) {
+    return `最近 ${diffHours} 小时`
+  }
+  if (isRecentWindow && diffDays >= 2 && diffDays <= 60) {
+    return `最近 ${diffDays} 天`
+  }
+  return `${startTime.format('MM-DD HH:mm')} 至 ${endTime.format('MM-DD HH:mm')}`
+})
+
+const requestTrendSeries = computed(() => {
+  const buckets = trendBuckets.value
+  const series = [
     {
       key: 'total',
       name: '总请求',
       color: '#0f6a58',
-      points: daily.map((item) => ({
-        label: item.bucket.slice(5),
+      points: buckets.map((item) => ({
+        label: formatBucketLabel(item.bucket, trendGranularity.value),
         value: item.total_request_count,
       })),
     },
@@ -113,8 +223,8 @@ const dailyRequestTrendSeries = computed(() => {
       key: 'success',
       name: '成功',
       color: '#1f7c57',
-      points: daily.map((item) => ({
-        label: item.bucket.slice(5),
+      points: buckets.map((item) => ({
+        label: formatBucketLabel(item.bucket, trendGranularity.value),
         value: item.success_request_count,
       })),
     },
@@ -122,24 +232,38 @@ const dailyRequestTrendSeries = computed(() => {
       key: 'failure',
       name: '失败',
       color: '#b4493f',
-      points: daily.map((item) => ({
-        label: item.bucket.slice(5),
+      points: buckets.map((item) => ({
+        label: formatBucketLabel(item.bucket, trendGranularity.value),
         value: item.failure_request_count,
       })),
     },
   ]
+
+  if (hasPendingTrend.value) {
+    series.push({
+      key: 'pending',
+      name: '进行中',
+      color: '#ad6b1f',
+      points: buckets.map((item) => ({
+        label: formatBucketLabel(item.bucket, trendGranularity.value),
+        value: item.pending_request_count,
+      })),
+    })
+  }
+
+  return series
 })
 
-const dailyTokenTrendSeries = computed(() => {
-  const daily = (usage.value?.daily ?? []).slice(-14)
+const tokenTrendSeries = computed(() => {
+  const buckets = trendBuckets.value
   return [
     {
       key: 'all',
       name: '总 Token',
       color: '#0f6a58',
       compact: true,
-      points: daily.map((item) => ({
-        label: item.bucket.slice(5),
+      points: buckets.map((item) => ({
+        label: formatBucketLabel(item.bucket, trendGranularity.value),
         value: item.token_usage.all_tokens,
       })),
     },
@@ -148,8 +272,8 @@ const dailyTokenTrendSeries = computed(() => {
       name: '输入',
       color: '#1f7c57',
       compact: true,
-      points: daily.map((item) => ({
-        label: item.bucket.slice(5),
+      points: buckets.map((item) => ({
+        label: formatBucketLabel(item.bucket, trendGranularity.value),
         value: item.token_usage.read_input_tokens,
       })),
     },
@@ -158,8 +282,8 @@ const dailyTokenTrendSeries = computed(() => {
       name: '缓存',
       color: '#ad6b1f',
       compact: true,
-      points: daily.map((item) => ({
-        label: item.bucket.slice(5),
+      points: buckets.map((item) => ({
+        label: formatBucketLabel(item.bucket, trendGranularity.value),
         value: item.token_usage.cache_read_input_tokens,
       })),
     },
@@ -168,8 +292,8 @@ const dailyTokenTrendSeries = computed(() => {
       name: '输出',
       color: '#b4493f',
       compact: true,
-      points: daily.map((item) => ({
-        label: item.bucket.slice(5),
+      points: buckets.map((item) => ({
+        label: formatBucketLabel(item.bucket, trendGranularity.value),
         value: item.token_usage.write_output_tokens,
       })),
     },
@@ -178,8 +302,8 @@ const dailyTokenTrendSeries = computed(() => {
       name: '思考',
       color: '#7f5ca8',
       compact: true,
-      points: daily.map((item) => ({
-        label: item.bucket.slice(5),
+      points: buckets.map((item) => ({
+        label: formatBucketLabel(item.bucket, trendGranularity.value),
         value: item.token_usage.write_reasoning_tokens,
       })),
     },
@@ -211,6 +335,8 @@ async function load() {
       credential_id: credentialFilter.value ?? undefined,
       api_key_id: apiKeyFilter.value ?? undefined,
       only_failures: onlyFailures.value,
+      started_after: startedAfter.value,
+      started_before: startedBefore.value,
     }
 
     const [recordResponse, usageResponse, credentialResponse, apiKeyResponse] = await Promise.all([
@@ -292,7 +418,7 @@ onMounted(() => {
     <p v-if="errorMessage" class="page-error">{{ errorMessage }}</p>
 
     <n-card class="app-shell-card" :bordered="false">
-      <n-space justify="space-between" wrap>
+      <n-space justify="space-between" align="center" wrap>
         <n-space wrap>
           <n-select
             v-model:value="credentialFilter"
@@ -308,7 +434,13 @@ onMounted(() => {
             placeholder="筛选 API key"
             style="width: 220px"
           />
-          <n-input-number v-model:value="pageSize" :min="10" :max="500" :precision="0" />
+          <n-date-picker
+            v-model:value="timeRange"
+            clearable
+            type="datetimerange"
+            value-format="timestamp"
+            style="width: min(420px, 92vw)"
+          />
           <n-space align="center">
             <span class="filter-label">只看失败</span>
             <n-switch v-model:value="onlyFailures" />
@@ -316,6 +448,9 @@ onMounted(() => {
         </n-space>
         <n-button type="primary" secondary @click="applyFilters">应用筛选</n-button>
       </n-space>
+      <div class="filter-hint">
+        时间范围会同时影响顶部统计、趋势图和下方请求记录。
+      </div>
     </n-card>
 
     <template v-if="usage">
@@ -324,7 +459,7 @@ onMounted(() => {
           <metric-card
             title="筛选范围请求数"
             :value="formatNumber(usage.summary.total_request_count)"
-            :note="`当前页 ${formatNumber(records.length)} 条，共 ${formatNumber(totalRecords)} 条`"
+            :note="`已完成 ${formatNumber(completedRequestCount)} 条 · 进行中 ${formatNumber(pendingRequestCount)} 条 · 当前页 ${formatNumber(records.length)} 条`"
             tone="accent"
           />
         </n-grid-item>
@@ -332,7 +467,7 @@ onMounted(() => {
           <metric-card
             title="成功"
             :value="formatNumber(usage.summary.success_request_count)"
-            :note="`${formatNumber(usage.summary.http_request_count)} HTTP · ${formatNumber(usage.summary.websocket_request_count)} WS`"
+            :note="`已完成成功率 ${successRate} · ${formatNumber(usage.summary.http_request_count)} HTTP · ${formatNumber(usage.summary.websocket_request_count)} WS`"
             tone="success"
           />
         </n-grid-item>
@@ -340,7 +475,7 @@ onMounted(() => {
           <metric-card
             title="失败"
             :value="formatNumber(usage.summary.failure_request_count)"
-            :note="`失败占比 ${failureRate}`"
+            :note="`已完成失败率 ${failureRate}`"
             tone="danger"
           />
         </n-grid-item>
@@ -370,18 +505,34 @@ onMounted(() => {
         <token-usage-strip :usage="usage.summary.token_usage" />
       </n-card>
 
+      <div class="trend-toolbar app-shell-card">
+        <div>
+          <div class="section-title">趋势设置</div>
+          <div class="section-note">
+            时间范围：{{ timeRangeLabel }}。点击图表上方摘要可以自由显示或隐藏任意曲线。
+          </div>
+        </div>
+        <n-select
+          v-model:value="trendGranularity"
+          :options="trendGranularityOptions"
+          style="width: 140px"
+        />
+      </div>
+
       <n-grid cols="1 m:2" responsive="screen" :x-gap="18" :y-gap="18">
         <n-grid-item>
           <n-card class="section-card app-shell-card" :bordered="false">
             <template #header>
               <div class="section-headline">
                 <div>
-                  <div class="section-title">按天请求趋势</div>
-                  <div class="section-note">当前筛选范围最近 14 天，合并展示总请求、成功、失败</div>
+                  <div class="section-title">{{ trendGranularityLabel }}请求趋势</div>
+                  <div class="section-note">
+                    当前筛选范围{{ timeRangeLabel }}，合并展示总请求、成功、失败{{ hasPendingTrend ? '、进行中' : '' }}
+                  </div>
                 </div>
               </div>
             </template>
-            <multi-trend-chart :series="dailyRequestTrendSeries" />
+            <multi-trend-chart :series="requestTrendSeries" />
           </n-card>
         </n-grid-item>
         <n-grid-item>
@@ -389,12 +540,14 @@ onMounted(() => {
             <template #header>
               <div class="section-headline">
                 <div>
-                  <div class="section-title">按天 Token 趋势</div>
-                  <div class="section-note">当前筛选范围最近 14 天，合并展示输入、缓存、输出、思考与总量</div>
+                  <div class="section-title">{{ trendGranularityLabel }} Token 趋势</div>
+                  <div class="section-note">
+                    当前筛选范围{{ timeRangeLabel }}，合并展示输入、缓存、输出、思考与总量
+                  </div>
                 </div>
               </div>
             </template>
-            <multi-trend-chart :series="dailyTokenTrendSeries" />
+            <multi-trend-chart :series="tokenTrendSeries" />
           </n-card>
         </n-grid-item>
       </n-grid>
@@ -455,9 +608,9 @@ onMounted(() => {
                 <n-space vertical size="small" align="start">
                   <n-tag
                     size="small"
-                    :type="item.request_success ? 'success' : item.request_success === false ? 'error' : 'default'"
+                    :type="statusTagType(item.request_success)"
                   >
-                    {{ item.request_success === true ? 'success' : item.request_success === false ? 'failure' : 'unknown' }}
+                    {{ formatStatusLabel(item.request_success) }}
                   </n-tag>
                   <n-tag size="small" type="warning" v-if="item.status_code">
                     {{ item.status_code }}
@@ -482,8 +635,8 @@ onMounted(() => {
                 </div>
               </td>
               <td>
-                <div class="cell-meta">{{ item.error_code ?? item.error_phase ?? '无' }}</div>
-                <div class="cell-meta">{{ item.error_message ?? '无错误消息' }}</div>
+                <div class="cell-meta">{{ item.error_code ?? item.error_phase ?? (item.request_success === null ? '进行中' : '无') }}</div>
+                <div class="cell-meta">{{ item.error_message ?? (item.request_success === null ? '请求尚未结束' : '无错误消息') }}</div>
               </td>
               <td>
                 <div class="cell-meta">总量 {{ formatTokenCompact(item.token_usage.all_tokens) }}</div>
@@ -546,12 +699,12 @@ onMounted(() => {
               <template #header>错误信息</template>
               <div class="detail-grid">
                 <div><strong>状态码</strong><div>{{ selectedRecord.status_code ?? '未提供' }}</div></div>
-                <div><strong>成功</strong><div>{{ selectedRecord.request_success ?? 'unknown' }}</div></div>
+                <div><strong>状态</strong><div>{{ formatStatusLabel(selectedRecord.request_success) }}</div></div>
                 <div><strong>Error Phase</strong><div>{{ selectedRecord.error_phase ?? '无' }}</div></div>
                 <div><strong>Error Code</strong><div>{{ selectedRecord.error_code ?? '无' }}</div></div>
                 <div style="grid-column: 1 / -1">
                   <strong>Error Message</strong>
-                  <div>{{ selectedRecord.error_message ?? '无错误消息' }}</div>
+                  <div>{{ selectedRecord.error_message ?? (selectedRecord.request_success === null ? '请求尚未结束' : '无错误消息') }}</div>
                 </div>
               </div>
             </n-card>
@@ -621,10 +774,23 @@ onMounted(() => {
 
 .section-note,
 .filter-label,
-.cell-meta {
+.cell-meta,
+.filter-hint {
   color: var(--cp-text-soft);
   font-size: 12px;
   line-height: 1.7;
+}
+
+.filter-hint {
+  margin-top: 10px;
+}
+
+.trend-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px;
 }
 
 .cell-title {
@@ -657,8 +823,10 @@ onMounted(() => {
 
 @media (max-width: 1023px) {
   .page-head,
-  .section-headline {
+  .section-headline,
+  .trend-toolbar {
     flex-direction: column;
+    align-items: flex-start;
   }
 
   .table-pagination {

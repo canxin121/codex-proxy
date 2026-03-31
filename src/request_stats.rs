@@ -65,8 +65,8 @@ impl TimeBucket {
         match self {
             Self::Hour => Func::cust(Alias::new("substr"))
                 .arg(Expr::col(request_record::Column::RequestStartedAt))
-                .arg(12)
-                .arg(2)
+                .arg(1)
+                .arg(13)
                 .into(),
             Self::Day => Func::cust(Alias::new("substr"))
                 .arg(Expr::col(request_record::Column::RequestStartedAt))
@@ -79,7 +79,13 @@ impl TimeBucket {
     fn normalize_label(self, value: Option<String>) -> String {
         let value = value.unwrap_or_else(|| "unknown".to_string());
         match self {
-            Self::Hour => format!("{value}:00"),
+            Self::Hour => {
+                if value == "unknown" {
+                    value
+                } else {
+                    format!("{}:00", value.replace('T', " "))
+                }
+            }
             Self::Day => value,
         }
     }
@@ -333,7 +339,7 @@ impl RequestObservation {
 
         match event_kind {
             Some("response.completed") => {
-                self.success = Some(true);
+                self.mark_success();
             }
             Some("response.failed") => {
                 self.mark_failure(
@@ -387,6 +393,13 @@ impl RequestObservation {
                 }
             }
         }
+    }
+
+    fn mark_success(&mut self) {
+        self.success = Some(true);
+        self.error_phase = None;
+        self.error_code = None;
+        self.error_message = None;
     }
 
     pub fn mark_failure(
@@ -572,21 +585,21 @@ pub async fn start_request_record(
 }
 
 pub async fn request_stats_overall(state: &AppState) -> Result<RequestStatsSummaryView, AppError> {
-    request_stats_with_scope(state, None, None, false).await
+    request_stats_with_scope(state, None, None, false, None, None).await
 }
 
 pub async fn request_stats_for_credential(
     state: &AppState,
     credential_id: &str,
 ) -> Result<RequestStatsSummaryView, AppError> {
-    request_stats_with_scope(state, Some(credential_id), None, false).await
+    request_stats_with_scope(state, Some(credential_id), None, false, None, None).await
 }
 
 pub async fn request_stats_for_api_key(
     state: &AppState,
     api_key_id: &str,
 ) -> Result<RequestStatsSummaryView, AppError> {
-    request_stats_with_scope(state, None, Some(api_key_id), false).await
+    request_stats_with_scope(state, None, Some(api_key_id), false, None, None).await
 }
 
 pub async fn usage_stats(
@@ -600,29 +613,51 @@ pub async fn usage_stats(
     let only_failures = query.only_failures.unwrap_or(false);
     let credential_id = query.credential_id.as_deref();
     let api_key_id = query.api_key_id.as_deref();
+    let started_after = query.started_after.as_ref();
+    let started_before = query.started_before.as_ref();
 
     let (summary, duration, hourly, daily, transports, status_codes, error_phases) = tokio::try_join!(
-        request_stats_with_scope(state, credential_id, api_key_id, only_failures),
-        duration_stats_with_scope(state, credential_id, api_key_id, only_failures),
-        usage_time_buckets_with_scope(
+        request_stats_with_scope(
             state,
             credential_id,
             api_key_id,
             only_failures,
-            TimeBucket::Hour
+            started_after,
+            started_before,
+        ),
+        duration_stats_with_scope(
+            state,
+            credential_id,
+            api_key_id,
+            only_failures,
+            started_after,
+            started_before,
         ),
         usage_time_buckets_with_scope(
             state,
             credential_id,
             api_key_id,
             only_failures,
-            TimeBucket::Day
+            started_after,
+            started_before,
+            TimeBucket::Hour,
+        ),
+        usage_time_buckets_with_scope(
+            state,
+            credential_id,
+            api_key_id,
+            only_failures,
+            started_after,
+            started_before,
+            TimeBucket::Day,
         ),
         request_breakdown_with_scope(
             state,
             credential_id,
             api_key_id,
             only_failures,
+            started_after,
+            started_before,
             BreakdownDimension::Transport,
             top,
         ),
@@ -631,6 +666,8 @@ pub async fn usage_stats(
             credential_id,
             api_key_id,
             only_failures,
+            started_after,
+            started_before,
             BreakdownDimension::StatusCode,
             top,
         ),
@@ -639,6 +676,8 @@ pub async fn usage_stats(
             credential_id,
             api_key_id,
             only_failures,
+            started_after,
+            started_before,
             BreakdownDimension::ErrorPhase,
             top,
         ),
@@ -651,6 +690,8 @@ pub async fn usage_stats(
             api_key_id: query.api_key_id.clone(),
             only_failures,
             top,
+            started_after: query.started_after.clone(),
+            started_before: query.started_before.clone(),
         },
         summary,
         duration,
@@ -691,19 +732,15 @@ pub async fn list_request_records(
     state: &AppState,
     query: &ListRequestRecordsQuery,
 ) -> Result<PaginatedResponse<RequestRecordView>, AppError> {
-    let mut select = request_record::Entity::find()
-        .order_by_desc(request_record::Column::RequestStartedAt)
-        .order_by_desc(request_record::Column::CreatedAt);
-
-    if let Some(credential_id) = query.credential_id.as_deref() {
-        select = select.filter(request_record::Column::CredentialId.eq(credential_id.to_string()));
-    }
-    if let Some(api_key_id) = query.api_key_id.as_deref() {
-        select = select.filter(request_record::Column::ApiKeyId.eq(api_key_id.to_string()));
-    }
-    if query.only_failures.unwrap_or(false) {
-        select = select.filter(request_record::Column::RequestSuccess.eq(false));
-    }
+    let select = scoped_request_record_query(
+        query.credential_id.as_deref(),
+        query.api_key_id.as_deref(),
+        query.only_failures.unwrap_or(false),
+        query.started_after.as_ref(),
+        query.started_before.as_ref(),
+    )
+    .order_by_desc(request_record::Column::RequestStartedAt)
+    .order_by_desc(request_record::Column::CreatedAt);
 
     let limit = query
         .limit
@@ -981,8 +1018,16 @@ async fn request_stats_with_scope(
     credential_id: Option<&str>,
     api_key_id: Option<&str>,
     only_failures: bool,
+    started_after: Option<&DateTime<Utc>>,
+    started_before: Option<&DateTime<Utc>>,
 ) -> Result<RequestStatsSummaryView, AppError> {
-    let row = scoped_request_record_query(credential_id, api_key_id, only_failures)
+    let row = scoped_request_record_query(
+        credential_id,
+        api_key_id,
+        only_failures,
+        started_after,
+        started_before,
+    )
         .select_only()
         .column_as(request_record::Column::Id.count(), "total_request_count")
         .expr_as(
@@ -992,6 +1037,10 @@ async fn request_stats_with_scope(
         .expr_as(
             conditional_count_expr(Expr::col(request_record::Column::RequestSuccess).eq(false)),
             "failure_request_count",
+        )
+        .expr_as(
+            conditional_count_expr(Expr::col(request_record::Column::RequestSuccess).is_null()),
+            "pending_request_count",
         )
         .expr_as(
             conditional_count_expr(Expr::col(request_record::Column::Transport).eq("http")),
@@ -1036,8 +1085,16 @@ async fn duration_stats_with_scope(
     credential_id: Option<&str>,
     api_key_id: Option<&str>,
     only_failures: bool,
+    started_after: Option<&DateTime<Utc>>,
+    started_before: Option<&DateTime<Utc>>,
 ) -> Result<RequestDurationStatsView, AppError> {
-    let row = scoped_request_record_query(credential_id, api_key_id, only_failures)
+    let row = scoped_request_record_query(
+        credential_id,
+        api_key_id,
+        only_failures,
+        started_after,
+        started_before,
+    )
         .select_only()
         .expr_as(
             Func::avg(Expr::col(request_record::Column::DurationMs)),
@@ -1058,10 +1115,18 @@ async fn usage_time_buckets_with_scope(
     credential_id: Option<&str>,
     api_key_id: Option<&str>,
     only_failures: bool,
+    started_after: Option<&DateTime<Utc>>,
+    started_before: Option<&DateTime<Utc>>,
     bucket: TimeBucket,
 ) -> Result<Vec<UsageTimeBucketView>, AppError> {
     let bucket_expr = bucket.expression();
-    let rows = scoped_request_record_query(credential_id, api_key_id, only_failures)
+    let rows = scoped_request_record_query(
+        credential_id,
+        api_key_id,
+        only_failures,
+        started_after,
+        started_before,
+    )
         .select_only()
         .expr_as(bucket_expr.clone(), "bucket")
         .column_as(request_record::Column::Id.count(), "total_request_count")
@@ -1072,6 +1137,10 @@ async fn usage_time_buckets_with_scope(
         .expr_as(
             conditional_count_expr(Expr::col(request_record::Column::RequestSuccess).eq(false)),
             "failure_request_count",
+        )
+        .expr_as(
+            conditional_count_expr(Expr::col(request_record::Column::RequestSuccess).is_null()),
+            "pending_request_count",
         )
         .column_as(request_record::Column::InputTokens.sum(), "input_tokens")
         .column_as(
@@ -1105,13 +1174,21 @@ async fn request_breakdown_with_scope(
     credential_id: Option<&str>,
     api_key_id: Option<&str>,
     only_failures: bool,
+    started_after: Option<&DateTime<Utc>>,
+    started_before: Option<&DateTime<Utc>>,
     dimension: BreakdownDimension,
     limit: u64,
 ) -> Result<Vec<RequestBreakdownView>, AppError> {
     let (group_key_expr, group_label_expr) = dimension.expressions();
     let force_failures = only_failures || dimension.forces_failure_scope();
 
-    let rows = scoped_request_record_query(credential_id, api_key_id, force_failures)
+    let rows = scoped_request_record_query(
+        credential_id,
+        api_key_id,
+        force_failures,
+        started_after,
+        started_before,
+    )
         .select_only()
         .expr_as(group_key_expr.clone(), "group_key")
         .expr_as(group_label_expr.clone(), "group_label")
@@ -1196,6 +1273,8 @@ fn scoped_request_record_query(
     credential_id: Option<&str>,
     api_key_id: Option<&str>,
     only_failures: bool,
+    started_after: Option<&DateTime<Utc>>,
+    started_before: Option<&DateTime<Utc>>,
 ) -> Select<request_record::Entity> {
     let mut select = request_record::Entity::find();
     if let Some(credential_id) = credential_id {
@@ -1206,6 +1285,12 @@ fn scoped_request_record_query(
     }
     if only_failures {
         select = select.filter(request_record::Column::RequestSuccess.eq(false));
+    }
+    if let Some(started_after) = started_after {
+        select = select.filter(request_record::Column::RequestStartedAt.gte(started_after.to_owned()));
+    }
+    if let Some(started_before) = started_before {
+        select = select.filter(request_record::Column::RequestStartedAt.lte(started_before.to_owned()));
     }
     select
 }
@@ -1254,7 +1339,23 @@ fn response_container(value: &Value) -> &Value {
 }
 
 fn has_explicit_error_payload(value: &Value) -> bool {
-    response_container(value).get("error").is_some() || value.get("error").is_some()
+    // Codex/OpenAI success payloads routinely include `"error": null` on
+    // `response.created` and `response.completed`; only non-null payloads
+    // should be treated as explicit errors.
+    extract_error_payload(value).is_some_and(|error| match error {
+        Value::Null => false,
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(fields) => !fields.is_empty(),
+        _ => true,
+    })
+}
+
+fn extract_error_payload(value: &Value) -> Option<&Value> {
+    response_container(value)
+        .get("error")
+        .filter(|error| !error.is_null())
+        .or_else(|| value.get("error").filter(|error| !error.is_null()))
 }
 
 #[derive(Debug, Clone)]
@@ -1729,6 +1830,97 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_jsonl\",\"usa
         assert_eq!(
             finalization.error_message.as_deref(),
             Some("body message wins")
+        );
+    }
+
+    #[test]
+    fn request_observation_ignores_codex_null_error_fields_in_event_arrays() {
+        let mut observation = RequestObservation::new(None);
+        observation.observe_body_bytes(
+            br#"[
+                {
+                    "type": "response.created",
+                    "response": {
+                        "id": "resp_events",
+                        "status": "in_progress",
+                        "error": null
+                    }
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_events",
+                        "status": "completed",
+                        "error": null,
+                        "usage": {
+                            "input_tokens": 11,
+                            "output_tokens": 6,
+                            "total_tokens": 17
+                        }
+                    }
+                }
+            ]"#,
+        );
+
+        let finalization = observation.finish_http_response(StatusCode::OK);
+        assert!(finalization.request_success);
+        assert_eq!(finalization.error_phase, None);
+        assert_eq!(finalization.error_code, None);
+        assert_eq!(finalization.error_message, None);
+        assert_eq!(finalization.response_id.as_deref(), Some("resp_events"));
+        let usage = finalization.usage.expect("usage should be recorded");
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 6);
+        assert_eq!(usage.total_tokens, 17);
+    }
+
+    #[test]
+    fn response_completed_clears_stale_error_fields() {
+        let mut observation = RequestObservation::new(None);
+        observation.observe_json_value(&json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp_cleanup",
+                "status": "in_progress",
+                "error": {
+                    "code": null
+                }
+            }
+        }));
+        observation.observe_json_value(&json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_cleanup",
+                "status": "completed",
+                "error": null,
+                "usage": {
+                    "input_tokens": 3,
+                    "output_tokens": 2,
+                    "total_tokens": 5
+                }
+            }
+        }));
+
+        let finalization = observation.finish_http_response(StatusCode::OK);
+        assert!(finalization.request_success);
+        assert_eq!(finalization.error_phase, None);
+        assert_eq!(finalization.error_code, None);
+        assert_eq!(finalization.error_message, None);
+    }
+
+    #[test]
+    fn hourly_bucket_normalizes_full_timestamp_labels() {
+        assert_eq!(
+            TimeBucket::Hour.normalize_label(Some("2026-03-31T08".to_string())),
+            "2026-03-31 08:00"
+        );
+        assert_eq!(
+            TimeBucket::Hour.normalize_label(Some("2026-03-31 08".to_string())),
+            "2026-03-31 08:00"
+        );
+        assert_eq!(
+            TimeBucket::Hour.normalize_label(Some("unknown".to_string())),
+            "unknown"
         );
     }
 }

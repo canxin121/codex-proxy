@@ -37,12 +37,25 @@ const errorMessage = ref('')
 const overview = ref<StatsOverviewView | null>(null)
 const usage = ref<UsageStatsView | null>(null)
 
+const completedRequestCount = computed(() => {
+  const current = usage.value?.summary
+  if (!current) {
+    return 0
+  }
+  return current.success_request_count + current.failure_request_count
+})
+
+const pendingRequestCount = computed(() => usage.value?.summary.pending_request_count ?? 0)
+
 const successRate = computed(() => {
   const current = usage.value?.summary
-  if (!current || current.total_request_count === 0) {
+  if (!current) {
     return '0%'
   }
-  return formatPercent((current.success_request_count / current.total_request_count) * 100)
+  if (completedRequestCount.value === 0) {
+    return pendingRequestCount.value > 0 ? '未完成' : '0%'
+  }
+  return formatPercent((current.success_request_count / completedRequestCount.value) * 100)
 })
 
 const limitRemainingValue = computed(() => {
@@ -84,7 +97,7 @@ const limitRemainingNote = computed(() => {
 
 const dailyRequestTrendSeries = computed(() => {
   const daily = (usage.value?.daily ?? []).slice(-14)
-  return [
+  const series = [
     {
       key: 'total',
       name: '总请求',
@@ -113,6 +126,20 @@ const dailyRequestTrendSeries = computed(() => {
       })),
     },
   ]
+
+  if (daily.some((item) => item.pending_request_count > 0)) {
+    series.push({
+      key: 'pending',
+      name: '进行中',
+      color: '#ad6b1f',
+      points: daily.map((item) => ({
+        label: item.bucket.slice(5),
+        value: item.pending_request_count,
+      })),
+    })
+  }
+
+  return series
 })
 
 const dailyTokenTrendSeries = computed(() => {
@@ -264,7 +291,7 @@ onMounted(() => {
           <metric-card
             title="请求成功率"
             :value="successRate"
-            :note="`${formatNumber(usage.summary.total_request_count)} 次请求，失败 ${formatNumber(usage.summary.failure_request_count)} 次`"
+            :note="`已完成 ${formatNumber(completedRequestCount)} 次 · 进行中 ${formatNumber(pendingRequestCount)} 次 · 失败 ${formatNumber(usage.summary.failure_request_count)} 次`"
           />
         </n-grid-item>
         <n-grid-item>
@@ -309,7 +336,7 @@ onMounted(() => {
               <div class="section-headline">
                 <div>
                   <div class="section-title">请求趋势</div>
-                  <div class="section-note">最近 14 个自然日，合并展示总请求、成功、失败</div>
+                  <div class="section-note">最近 14 个自然日，合并展示总请求、成功、失败以及进行中</div>
                 </div>
               </div>
             </template>

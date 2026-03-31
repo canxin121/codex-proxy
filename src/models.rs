@@ -206,6 +206,10 @@ pub struct ListRequestRecordsQuery {
     pub api_key_id: Option<String>,
     #[serde(rename = "only_failures")]
     pub only_failures: Option<bool>,
+    #[serde(rename = "started_after")]
+    pub started_after: Option<DateTime<Utc>>,
+    #[serde(rename = "started_before")]
+    pub started_before: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -217,6 +221,10 @@ pub struct UsageStatsQuery {
     #[serde(rename = "only_failures")]
     pub only_failures: Option<bool>,
     pub top: Option<u64>,
+    #[serde(rename = "started_after")]
+    pub started_after: Option<DateTime<Utc>>,
+    #[serde(rename = "started_before")]
+    pub started_before: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -361,6 +369,8 @@ pub struct RequestStatsSummaryView {
     pub success_request_count: i64,
     #[serde(rename = "failure_request_count")]
     pub failure_request_count: i64,
+    #[serde(rename = "pending_request_count")]
+    pub pending_request_count: i64,
     #[serde(rename = "http_request_count")]
     pub http_request_count: i64,
     #[serde(rename = "websocket_request_count")]
@@ -394,6 +404,8 @@ pub struct UsageTimeBucketView {
     pub success_request_count: i64,
     #[serde(rename = "failure_request_count")]
     pub failure_request_count: i64,
+    #[serde(rename = "pending_request_count")]
+    pub pending_request_count: i64,
     #[serde(rename = "token_usage")]
     pub usage: RequestUsageTotalsView,
 }
@@ -427,6 +439,10 @@ pub struct UsageStatsFiltersView {
     #[serde(rename = "only_failures")]
     pub only_failures: bool,
     pub top: u64,
+    #[serde(rename = "started_after")]
+    pub started_after: Option<DateTime<Utc>>,
+    #[serde(rename = "started_before")]
+    pub started_before: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, Default, Clone)]
@@ -665,6 +681,7 @@ pub struct RequestStatsAggregateRow {
     pub total_request_count: Option<i64>,
     pub success_request_count: Option<i64>,
     pub failure_request_count: Option<i64>,
+    pub pending_request_count: Option<i64>,
     pub http_request_count: Option<i64>,
     pub websocket_request_count: Option<i64>,
     pub first_request_at: Option<DateTime<Utc>>,
@@ -690,6 +707,7 @@ pub struct UsageTimeBucketRow {
     pub total_request_count: Option<i64>,
     pub success_request_count: Option<i64>,
     pub failure_request_count: Option<i64>,
+    pub pending_request_count: Option<i64>,
     pub input_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
@@ -785,6 +803,7 @@ impl RequestStatsSummaryView {
             total_request_count: row.total_request_count.unwrap_or(0),
             success_request_count: row.success_request_count.unwrap_or(0),
             failure_request_count: row.failure_request_count.unwrap_or(0),
+            pending_request_count: row.pending_request_count.unwrap_or(0),
             http_request_count: row.http_request_count.unwrap_or(0),
             websocket_request_count: row.websocket_request_count.unwrap_or(0),
             first_request_at: row.first_request_at,
@@ -825,6 +844,7 @@ impl UsageTimeBucketView {
             total_request_count: row.total_request_count.unwrap_or(0),
             success_request_count: row.success_request_count.unwrap_or(0),
             failure_request_count: row.failure_request_count.unwrap_or(0),
+            pending_request_count: row.pending_request_count.unwrap_or(0),
             usage: RequestUsageTotalsView::from_numbers(
                 input_tokens,
                 cached_input_tokens,
