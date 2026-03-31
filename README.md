@@ -177,9 +177,10 @@ Both `/responses` and `/v1/responses` style paths are supported.
 cargo run -- \
   --bind 127.0.0.1:8787 \
   --data-dir /tmp/codex-proxy \
-  --admin-password 'your-console-password' \
-  --admin-key 'your-bootstrap-admin-key'
+  --admin-password 'your-console-password'
 ```
+
+首次进入网页控制台时，用管理密码登录。`admin key` 由你在后台按需创建，供自动化脚本调用后台管理接口。
 
 Useful auth-related options:
 

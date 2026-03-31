@@ -639,8 +639,6 @@ pub struct AdminKeyView {
     pub name: String,
     #[serde(rename = "is_enabled")]
     pub enabled: bool,
-    #[serde(rename = "is_bootstrap")]
-    pub is_bootstrap: bool,
     #[serde(rename = "admin_key_expires_at")]
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(rename = "last_admin_key_used_at")]
@@ -949,12 +947,11 @@ impl ApiKeyView {
 }
 
 impl AdminKeyView {
-    pub fn from_model(model: admin_key::Model, is_bootstrap: bool) -> Self {
+    pub fn from_model(model: admin_key::Model) -> Self {
         Self {
             id: model.id,
             name: model.name,
             enabled: model.enabled,
-            is_bootstrap,
             expires_at: model.expires_at,
             last_used_at: model.last_used_at,
             created_at: model.created_at,

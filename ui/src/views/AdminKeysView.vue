@@ -67,19 +67,13 @@ const filteredAdminKeys = computed(() => {
       return [item.admin_key_name, item.admin_key_id]
         .some((value) => value.toLowerCase().includes(keyword))
     })
-    .sort((left, right) => {
-      if (left.is_bootstrap !== right.is_bootstrap) {
-        return left.is_bootstrap ? -1 : 1
-      }
-      return left.admin_key_name.localeCompare(right.admin_key_name)
-    })
+    .sort((left, right) => left.admin_key_name.localeCompare(right.admin_key_name))
 })
 
 const summary = computed(() => ({
   total: totalAdminKeys.value,
   pageCount: adminKeys.value.length,
   enabled: adminKeys.value.filter((item) => item.is_enabled).length,
-  bootstrap: adminKeys.value.filter((item) => item.is_bootstrap).length,
   expired: adminKeys.value.filter((item) => item.admin_key_expires_at && new Date(item.admin_key_expires_at).getTime() <= Date.now()).length,
 }))
 
@@ -110,9 +104,6 @@ function openCreateModal() {
 }
 
 function openEditModal(item: AdminKeyView) {
-  if (item.is_bootstrap) {
-    return
-  }
   editingKey.value = item
   form.admin_key_name = item.admin_key_name
   form.is_enabled = item.is_enabled
@@ -172,9 +163,6 @@ async function submitForm() {
 }
 
 function confirmDelete(item: AdminKeyView) {
-  if (item.is_bootstrap) {
-    return
-  }
   dialog.warning({
     title: '删除 Admin key',
     content: `确认删除 ${item.admin_key_name}？`,
@@ -248,9 +236,6 @@ onMounted(() => {
         <metric-card title="当前页启用" :value="formatNumber(summary.enabled)" note="当前页可直接管理后台" tone="success" />
       </n-grid-item>
       <n-grid-item>
-        <metric-card title="Bootstrap" :value="formatNumber(summary.bootstrap)" note="系统引导 Admin key" tone="accent" />
-      </n-grid-item>
-      <n-grid-item>
         <metric-card title="当前页过期" :value="formatNumber(summary.expired)" note="当前页已过期 key 数量" tone="danger" />
       </n-grid-item>
     </n-grid>
@@ -292,7 +277,6 @@ onMounted(() => {
               <n-tag :type="item.is_enabled ? 'success' : 'default'">
                 {{ item.is_enabled ? '启用中' : '已禁用' }}
               </n-tag>
-              <n-tag v-if="item.is_bootstrap" type="warning">Bootstrap</n-tag>
             </n-space>
           </div>
         </template>
@@ -305,13 +289,13 @@ onMounted(() => {
 
         <template #action>
           <n-space justify="space-between" wrap>
-            <n-button tertiary size="small" :disabled="item.is_bootstrap" @click="openEditModal(item)">
+            <n-button tertiary size="small" @click="openEditModal(item)">
               <template #icon>
                 <n-icon><CreateOutline /></n-icon>
               </template>
               编辑
             </n-button>
-            <n-button tertiary type="error" size="small" :disabled="item.is_bootstrap" @click="confirmDelete(item)">
+            <n-button tertiary type="error" size="small" @click="confirmDelete(item)">
               <template #icon>
                 <n-icon><TrashOutline /></n-icon>
               </template>

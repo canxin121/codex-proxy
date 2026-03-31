@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     info!(
         admin_password_auth = true,
         admin_key_auth = true,
-        "using mixed admin authentication (password sessions + admin keys)",
+        "using admin authentication (password sessions + user-managed admin keys)",
     );
 
     let state = AppState::new(config.clone()).await?;

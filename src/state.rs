@@ -109,10 +109,17 @@ impl AuthenticatedPrincipalKind {
 }
 
 const ADMIN_SESSION_TTL_DAYS: i64 = 30;
-pub const BOOTSTRAP_ADMIN_KEY_ID: &str = "bootstrap-admin-key";
 
 pub struct SelectedCredential {
     pub model: credential::Model,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CredentialQuotaAssessment {
+    available: bool,
+    next_retry_at: Option<DateTime<Utc>>,
+    remaining_percent: Option<f64>,
+    has_available_credits: bool,
 }
 
 pub struct RequestLease {
@@ -146,7 +153,6 @@ impl AppState {
             .map_err(|err| AppError::internal(err.to_string()))?;
         ensure_sqlite_connection_writable(&db, &config.database_url).await?;
         initialize_database(&db).await?;
-        ensure_bootstrap_admin_key(&db, &config.admin_key_hash).await?;
         recover_auth_sessions(&db).await?;
         retain_latest_auth_session_per_credential(&db).await?;
 
@@ -444,7 +450,9 @@ impl AppState {
     pub async fn select_credential(
         &self,
         preferred_id: Option<&str>,
+        excluded_ids: &HashSet<String>,
     ) -> Result<SelectedCredential, AppError> {
+        let now = Utc::now();
         if let Some(preferred_id) = preferred_id {
             let model = credential::Entity::find_by_id(preferred_id.to_string())
                 .one(self.db())
@@ -457,6 +465,18 @@ impl AppState {
             if !self.credential_has_active_auth(&model.id).await {
                 return Err(AppError::service_unavailable(
                     "credential auth is not configured",
+                ));
+            }
+            let limits = credential_limit::Entity::find()
+                .filter(credential_limit::Column::CredentialId.eq(model.id.clone()))
+                .all(self.db())
+                .await
+                .map_err(|err| AppError::internal(err.to_string()))?;
+            let quota = assess_credential_quota(&limits, now);
+            if !quota.available {
+                return Err(no_available_quota_error(
+                    "preferred credential does not currently have available quota",
+                    quota.next_retry_at,
                 ));
             }
             return Ok(SelectedCredential { model });
@@ -475,7 +495,12 @@ impl AppState {
             ));
         }
 
+        let enabled_credential_ids = credentials
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
         let limit_rows = credential_limit::Entity::find()
+            .filter(credential_limit::Column::CredentialId.is_in(enabled_credential_ids))
             .all(self.db())
             .await
             .map_err(|err| AppError::internal(err.to_string()))?;
@@ -488,19 +513,40 @@ impl AppState {
                 .push(row);
         }
 
+        let mut any_authenticated = false;
+        let mut blocked_next_retry_at: Option<DateTime<Utc>> = None;
+        let mut saw_excluded_candidate = false;
         let mut best: Option<(f64, credential::Model)> = None;
         for model in credentials {
+            let is_excluded = excluded_ids.contains(&model.id);
             if !self.credential_has_active_auth(&model.id).await {
                 continue;
             }
-            let score = score_credential(
-                &model,
+            any_authenticated = true;
+            let quota = assess_credential_quota(
                 limits_by_credential
                     .get(&model.id)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
-                self.active_requests_for(&model.id),
+                now,
             );
+            if !quota.available {
+                if let Some(retry_at) = quota.next_retry_at {
+                    blocked_next_retry_at = Some(match blocked_next_retry_at {
+                        Some(current) => current.min(retry_at),
+                        None => retry_at,
+                    });
+                }
+                if is_excluded {
+                    saw_excluded_candidate = true;
+                }
+                continue;
+            }
+            if is_excluded {
+                saw_excluded_candidate = true;
+                continue;
+            }
+            let score = score_credential(&model, quota, self.active_requests_for(&model.id));
 
             match best.as_ref() {
                 Some((best_score, _)) if *best_score >= score => {}
@@ -508,11 +554,20 @@ impl AppState {
             }
         }
 
-        let (_, model) = best.ok_or_else(|| {
-            AppError::service_unavailable(
-                "no enabled authenticated Codex credentials are available",
-            )
-        })?;
+        let (_, model) = match best {
+            Some(best) => best,
+            None if any_authenticated || saw_excluded_candidate => {
+                return Err(no_available_quota_error(
+                    "no Codex credentials currently have available quota",
+                    blocked_next_retry_at,
+                ));
+            }
+            None => {
+                return Err(AppError::service_unavailable(
+                    "no enabled authenticated Codex credentials are available",
+                ));
+            }
+        };
         Ok(SelectedCredential { model })
     }
 
@@ -628,6 +683,64 @@ impl AppState {
             .update(self.db())
             .await
             .map_err(|err| AppError::internal(err.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn mark_credential_quota_exhausted(
+        &self,
+        credential_id: &str,
+        retry_at: Option<DateTime<Utc>>,
+        exhausted_credits: bool,
+    ) -> Result<(), AppError> {
+        let row_id = format!("{credential_id}:codex");
+        let existing = credential_limit::Entity::find_by_id(row_id.clone())
+            .one(self.db())
+            .await
+            .map_err(|err| AppError::internal(err.to_string()))?;
+        let now = Utc::now();
+
+        let mut active = existing
+            .map(credential_limit::ActiveModel::from)
+            .unwrap_or_else(|| credential_limit::ActiveModel {
+                id: Set(row_id),
+                credential_id: Set(credential_id.to_string()),
+                limit_id: Set("codex".to_string()),
+                limit_name: Set(None),
+                primary_used_percent: Set(None),
+                primary_window_minutes: Set(None),
+                primary_resets_at: Set(None),
+                secondary_used_percent: Set(None),
+                secondary_window_minutes: Set(None),
+                secondary_resets_at: Set(None),
+                has_credits: Set(None),
+                unlimited: Set(None),
+                balance: Set(None),
+                plan_type: Set(None),
+                updated_at: Set(now),
+            });
+
+        active.primary_used_percent = Set(Some(100.0));
+        if let Some(retry_at) = retry_at {
+            active.primary_resets_at = Set(Some(retry_at));
+        }
+        if exhausted_credits {
+            active.has_credits = Set(Some(false));
+            active.unlimited = Set(Some(false));
+        }
+        active.updated_at = Set(now);
+
+        if active.id.is_set() && active.credential_id.is_set() {
+            active
+                .insert(self.db())
+                .await
+                .map_err(|err| AppError::internal(err.to_string()))?;
+        } else {
+            active
+                .update(self.db())
+                .await
+                .map_err(|err| AppError::internal(err.to_string()))?;
+        }
+        self.mark_limit_sync_now(credential_id).await?;
         Ok(())
     }
 
@@ -768,24 +881,162 @@ fn auth_requires_reauthentication(manager: &AuthManager, auth: &CodexAuth) -> bo
     }
 }
 
+fn no_available_quota_error(message: &str, next_retry_at: Option<DateTime<Utc>>) -> AppError {
+    match next_retry_at {
+        Some(next_retry_at) => AppError::service_unavailable(format!(
+            "{message}; next retry at {}",
+            next_retry_at.to_rfc3339()
+        )),
+        None => AppError::service_unavailable(message.to_string()),
+    }
+}
+
+fn assess_credential_quota(
+    limits: &[credential_limit::Model],
+    now: DateTime<Utc>,
+) -> CredentialQuotaAssessment {
+    if limits.is_empty() {
+        return CredentialQuotaAssessment {
+            available: true,
+            next_retry_at: None,
+            remaining_percent: None,
+            has_available_credits: false,
+        };
+    }
+
+    let mut available = true;
+    let mut next_retry_at: Option<DateTime<Utc>> = None;
+    let mut blocked_without_retry = false;
+    let mut remaining_percent: Option<f64> = None;
+    let mut has_available_credits = false;
+
+    for limit in limits {
+        if limit.unlimited == Some(true) || limit.has_credits == Some(true) {
+            has_available_credits = true;
+        }
+        if limit.unlimited == Some(false) && limit.has_credits == Some(false) {
+            available = false;
+            blocked_without_retry = true;
+            remaining_percent = Some(match remaining_percent {
+                Some(current) => current.min(0.0),
+                None => 0.0,
+            });
+            continue;
+        }
+
+        for window in [
+            assess_limit_window(
+                limit.primary_used_percent,
+                limit.primary_resets_at,
+                limit.primary_window_minutes,
+                limit.updated_at,
+                now,
+            ),
+            assess_limit_window(
+                limit.secondary_used_percent,
+                limit.secondary_resets_at,
+                limit.secondary_window_minutes,
+                limit.updated_at,
+                now,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            remaining_percent = Some(match remaining_percent {
+                Some(current) => current.min(window.remaining_percent),
+                None => window.remaining_percent,
+            });
+
+            if window.blocked {
+                available = false;
+                if let Some(window_retry_at) = window.next_retry_at {
+                    next_retry_at = Some(match next_retry_at {
+                        Some(current) => current.max(window_retry_at),
+                        None => window_retry_at,
+                    });
+                } else {
+                    blocked_without_retry = true;
+                }
+            }
+        }
+    }
+
+    if blocked_without_retry {
+        next_retry_at = None;
+    }
+
+    CredentialQuotaAssessment {
+        available,
+        next_retry_at,
+        remaining_percent,
+        has_available_credits,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LimitWindowAssessment {
+    blocked: bool,
+    next_retry_at: Option<DateTime<Utc>>,
+    remaining_percent: f64,
+}
+
+fn assess_limit_window(
+    used_percent: Option<f64>,
+    resets_at: Option<DateTime<Utc>>,
+    window_minutes: Option<i64>,
+    updated_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<LimitWindowAssessment> {
+    let used_percent = used_percent?.clamp(0.0, 100.0);
+    if used_percent < 100.0 {
+        return Some(LimitWindowAssessment {
+            blocked: false,
+            next_retry_at: None,
+            remaining_percent: 100.0 - used_percent,
+        });
+    }
+
+    let next_retry_at = effective_limit_window_reset_at(resets_at, window_minutes, updated_at);
+    match next_retry_at {
+        Some(next_retry_at) if next_retry_at > now => Some(LimitWindowAssessment {
+            blocked: true,
+            next_retry_at: Some(next_retry_at),
+            remaining_percent: 0.0,
+        }),
+        Some(_) => Some(LimitWindowAssessment {
+            blocked: false,
+            next_retry_at: None,
+            remaining_percent: 100.0,
+        }),
+        None => Some(LimitWindowAssessment {
+            blocked: true,
+            next_retry_at: None,
+            remaining_percent: 0.0,
+        }),
+    }
+}
+
+fn effective_limit_window_reset_at(
+    resets_at: Option<DateTime<Utc>>,
+    window_minutes: Option<i64>,
+    updated_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    resets_at.or_else(|| {
+        window_minutes
+            .filter(|minutes| *minutes > 0)
+            .map(chrono::Duration::minutes)
+            .and_then(|duration| updated_at.checked_add_signed(duration))
+    })
+}
+
 fn score_credential(
     model: &credential::Model,
-    limits: &[credential_limit::Model],
+    quota: CredentialQuotaAssessment,
     active_requests: usize,
 ) -> f64 {
-    let base = if limits.is_empty() {
-        55.0
-    } else {
-        limits
-            .iter()
-            .map(limit_remaining_percent)
-            .fold(100.0, f64::min)
-    };
-
-    let credits_bonus = if limits
-        .iter()
-        .any(|limit| limit.unlimited == Some(true) || limit.has_credits == Some(true))
-    {
+    let base = quota.remaining_percent.unwrap_or(55.0);
+    let credits_bonus = if quota.has_available_credits {
         10.0
     } else {
         0.0
@@ -796,18 +1047,6 @@ fn score_credential(
     let active_penalty = (active_requests as f64) * 15.0;
 
     base + credits_bonus + weight_bonus - failure_penalty - active_penalty
-}
-
-fn limit_remaining_percent(limit: &credential_limit::Model) -> f64 {
-    let primary = limit
-        .primary_used_percent
-        .map(|value| 100.0 - value)
-        .unwrap_or(100.0);
-    let secondary = limit
-        .secondary_used_percent
-        .map(|value| 100.0 - value)
-        .unwrap_or(100.0);
-    primary.min(secondary)
 }
 
 pub fn hash_api_key(key: &str) -> String {
@@ -1485,47 +1724,6 @@ async fn initialize_database(db: &DatabaseConnection) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn ensure_bootstrap_admin_key(
-    db: &DatabaseConnection,
-    admin_key_hash: &str,
-) -> Result<(), AppError> {
-    let now = Utc::now();
-    let existing = admin_key::Entity::find_by_id(BOOTSTRAP_ADMIN_KEY_ID.to_string())
-        .one(db)
-        .await
-        .map_err(|err| AppError::internal(err.to_string()))?;
-
-    if let Some(model) = existing {
-        let mut active = admin_key::ActiveModel::from(model);
-        active.name = Set("bootstrap".to_string());
-        active.key_hash = Set(admin_key_hash.to_string());
-        active.enabled = Set(true);
-        active.expires_at = Set(None);
-        active.updated_at = Set(now);
-        active
-            .update(db)
-            .await
-            .map_err(|err| AppError::internal(err.to_string()))?;
-        return Ok(());
-    }
-
-    admin_key::ActiveModel {
-        id: Set(BOOTSTRAP_ADMIN_KEY_ID.to_string()),
-        name: Set("bootstrap".to_string()),
-        key_hash: Set(admin_key_hash.to_string()),
-        enabled: Set(true),
-        expires_at: Set(None),
-        last_used_at: Set(None),
-        created_at: Set(now),
-        updated_at: Set(now),
-    }
-    .insert(db)
-    .await
-    .map_err(|err| AppError::internal(err.to_string()))?;
-
-    Ok(())
-}
-
 async fn recover_auth_sessions(db: &DatabaseConnection) -> Result<(), AppError> {
     crate::entities::auth_session::Entity::update_many()
         .col_expr(
@@ -1580,11 +1778,40 @@ async fn retain_latest_auth_session_per_credential(
 
 #[cfg(test)]
 mod tests {
+    use super::CredentialQuotaAssessment;
+    use super::assess_credential_quota;
     use super::sqlite_database_path;
     use super::sqlite_query_value;
     use super::validate_sqlite_database_url;
+    use crate::entities::credential_limit;
     use crate::error::AppError;
+    use chrono::DateTime;
+    use chrono::Utc;
     use std::path::PathBuf;
+
+    fn timestamp(value: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(value, 0).expect("timestamp should be valid")
+    }
+
+    fn limit_model() -> credential_limit::Model {
+        credential_limit::Model {
+            id: "cred-1:codex".to_string(),
+            credential_id: "cred-1".to_string(),
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            primary_used_percent: None,
+            primary_window_minutes: None,
+            primary_resets_at: None,
+            secondary_used_percent: None,
+            secondary_window_minutes: None,
+            secondary_resets_at: None,
+            has_credits: None,
+            unlimited: None,
+            balance: None,
+            plan_type: None,
+            updated_at: timestamp(1_700_000_000),
+        }
+    }
 
     #[test]
     fn sqlite_database_path_extracts_file_backed_sqlite_urls() {
@@ -1647,5 +1874,62 @@ mod tests {
         assert!(validate_sqlite_database_url("sqlite:///tmp/db.sqlite?mode=rwc").is_ok());
         assert!(validate_sqlite_database_url("sqlite://relative/db.sqlite").is_ok());
         assert!(validate_sqlite_database_url("postgres://localhost/db").is_ok());
+    }
+
+    #[test]
+    fn assess_credential_quota_blocks_future_reset_windows() {
+        let mut limit = limit_model();
+        limit.primary_used_percent = Some(100.0);
+        limit.primary_resets_at = Some(timestamp(1_700_000_300));
+
+        let assessment = assess_credential_quota(&[limit], timestamp(1_700_000_000));
+
+        assert_eq!(
+            assessment,
+            CredentialQuotaAssessment {
+                available: false,
+                next_retry_at: Some(timestamp(1_700_000_300)),
+                remaining_percent: Some(0.0),
+                has_available_credits: false,
+            }
+        );
+    }
+
+    #[test]
+    fn assess_credential_quota_retries_after_reset_time_passes() {
+        let mut limit = limit_model();
+        limit.primary_used_percent = Some(100.0);
+        limit.primary_resets_at = Some(timestamp(1_700_000_300));
+
+        let assessment = assess_credential_quota(&[limit], timestamp(1_700_000_301));
+
+        assert_eq!(
+            assessment,
+            CredentialQuotaAssessment {
+                available: true,
+                next_retry_at: None,
+                remaining_percent: Some(100.0),
+                has_available_credits: false,
+            }
+        );
+    }
+
+    #[test]
+    fn assess_credential_quota_blocks_when_credits_are_exhausted() {
+        let mut limit = limit_model();
+        limit.has_credits = Some(false);
+        limit.unlimited = Some(false);
+
+        let assessment = assess_credential_quota(&[limit], timestamp(1_700_000_000));
+
+        assert_eq!(
+            assessment,
+            CredentialQuotaAssessment {
+                available: false,
+                next_retry_at: None,
+                remaining_percent: Some(0.0),
+                has_available_credits: false,
+            }
+        );
     }
 }

@@ -53,7 +53,6 @@ use crate::request_stats::usage_stats as query_usage_stats;
 use crate::state::AppState;
 use crate::state::AuthenticatedPrincipal;
 use crate::state::AuthenticatedPrincipalKind;
-use crate::state::BOOTSTRAP_ADMIN_KEY_ID;
 use crate::state::RequestLease;
 use crate::state::credential_view_material;
 use axum::Json;
@@ -109,6 +108,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::connect_async_tls_with_config;
@@ -921,29 +921,7 @@ async fn update_admin_key(
     Json(payload): Json<UpdateAdminKeyRequest>,
 ) -> Result<Json<AdminKeyView>, AppError> {
     require_admin(&state, &headers).await?;
-    let existing = find_admin_key(&state, &id).await?;
-    if existing.id == BOOTSTRAP_ADMIN_KEY_ID {
-        return Err(AppError::forbidden(
-            "bootstrap admin key cannot be modified",
-        ));
-    }
-    if let Some(enabled) = payload.enabled
-        && !enabled
-        && existing.enabled
-    {
-        let enabled_count = admin_key::Entity::find()
-            .filter(admin_key::Column::Enabled.eq(true))
-            .count(state.db())
-            .await
-            .map_err(|err| AppError::internal(err.to_string()))?;
-        if enabled_count <= 1 {
-            return Err(AppError::forbidden(
-                "at least one enabled admin key is required",
-            ));
-        }
-    }
-
-    let mut active = admin_key::ActiveModel::from(existing);
+    let mut active = admin_key::ActiveModel::from(find_admin_key(&state, &id).await?);
     if let Some(name) = payload.name {
         active.name = Set(name);
     }
@@ -1093,22 +1071,7 @@ async fn delete_admin_key(
     headers: HeaderMap,
 ) -> Result<StatusCode, AppError> {
     require_admin(&state, &headers).await?;
-    let existing = find_admin_key(&state, &id).await?;
-    if existing.id == BOOTSTRAP_ADMIN_KEY_ID {
-        return Err(AppError::forbidden("bootstrap admin key cannot be deleted"));
-    }
-    if existing.enabled {
-        let enabled_count = admin_key::Entity::find()
-            .filter(admin_key::Column::Enabled.eq(true))
-            .count(state.db())
-            .await
-            .map_err(|err| AppError::internal(err.to_string()))?;
-        if enabled_count <= 1 {
-            return Err(AppError::forbidden(
-                "at least one enabled admin key is required",
-            ));
-        }
-    }
+    find_admin_key(&state, &id).await?;
 
     admin_key::Entity::delete_by_id(id)
         .exec(state.db())
@@ -1166,137 +1129,150 @@ async fn proxy_http(
 ) -> Result<Response<Body>, AppError> {
     let principal = require_client(state, &headers).await?;
     let preferred_credential = preferred_credential_from_headers(&headers);
-    let selected = state
-        .select_credential(preferred_credential.as_deref())
-        .await?;
     let requested_model = extract_requested_model_from_bytes(&body);
-    let mut request_record = start_request_record(
-        state,
-        RequestRecordStart {
-            principal,
-            credential: selected.model.clone(),
-            transport: "http",
-            method: method.to_string(),
-            path: normalized_path.to_string(),
-            requested_model: requested_model.clone(),
-        },
-    )
-    .await?;
-    let manager = state.auth_manager(&selected.model.id).await;
-    let lease = state.acquire_request_lease(selected.model.id.clone());
-    let response = match send_http_with_recovery(
-        state,
-        &selected.model,
-        &manager,
-        method,
-        normalized_path,
-        &headers,
-        body,
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            let mut observation = RequestObservation::new(requested_model);
-            observation.mark_failure("upstream_request", None, err.to_string(), None);
-            let finalization = observation.finalize();
-            request_record.finalize(finalization.clone()).await?;
-            sync_credential_transient_state(state, &selected.model.id, &finalization).await?;
-            return Err(err);
-        }
-    };
+    let allow_failover = preferred_credential.is_none();
+    let mut excluded_credentials = HashSet::new();
 
-    state.record_credential_touch(&selected.model.id).await?;
-    state
-        .update_rate_limits_from_headers(&selected.model.id, response.headers())
+    loop {
+        let selected = state
+            .select_credential(preferred_credential.as_deref(), &excluded_credentials)
+            .await?;
+        let mut request_record = start_request_record(
+            state,
+            RequestRecordStart {
+                principal: principal.clone(),
+                credential: selected.model.clone(),
+                transport: "http",
+                method: method.to_string(),
+                path: normalized_path.to_string(),
+                requested_model: requested_model.clone(),
+            },
+        )
         .await?;
-    let status = response.status();
-    let response_headers = response.headers().clone();
-
-    let is_event_stream = response_headers
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.contains("text/event-stream"))
-        .unwrap_or(false);
-
-    if is_event_stream {
-        let state = state.clone();
-        let credential_id = selected.model.id.clone();
-        let body_stream = async_stream::stream! {
-            let _lease = lease;
-            let mut stream = response.bytes_stream();
-            let mut parser = SseEventParser::default();
-            let mut observation = RequestObservation::new(requested_model);
-            let mut request_record = request_record;
-            let mut finalized = false;
-
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(bytes) => {
-                        parser.feed(&bytes, &mut observation);
-                        if !finalized && observation.is_terminal() {
-                            let finalization = std::mem::take(&mut observation).finalize();
-                            let _ = request_record.finalize(finalization.clone()).await;
-                            let _ = sync_credential_transient_state(&state, &credential_id, &finalization).await;
-                            finalized = true;
-                        }
-                        yield Result::<Bytes, std::io::Error>::Ok(bytes);
-                    }
-                    Err(err) => {
-                        if !finalized {
-                            observation.mark_failure_if_missing(
-                                "upstream_stream",
-                                Some("stream_read_error".to_string()),
-                                err.to_string(),
-                                Some(i32::from(status.as_u16())),
-                            );
-                            let finalization = std::mem::take(&mut observation).finalize();
-                            let _ = request_record.finalize(finalization.clone()).await;
-                            let _ = sync_credential_transient_state(&state, &credential_id, &finalization).await;
-                            finalized = true;
-                        }
-                        yield Result::<Bytes, std::io::Error>::Err(std::io::Error::other(err));
-                        break;
-                    }
-                }
-            }
-
-            if !finalized {
-                parser.finish(&mut observation);
-                let finalization = observation.finish_sse_response(status);
-                let _ = request_record.finalize(finalization.clone()).await;
-                let _ = sync_credential_transient_state(&state, &credential_id, &finalization).await;
+        let manager = state.auth_manager(&selected.model.id).await;
+        let lease = state.acquire_request_lease(selected.model.id.clone());
+        let response = match send_http_with_recovery(
+            state,
+            &selected.model,
+            &manager,
+            method,
+            normalized_path,
+            &headers,
+            body.clone(),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                let mut observation = RequestObservation::new(requested_model.clone());
+                observation.mark_failure("upstream_request", None, err.to_string(), None);
+                let finalization = observation.finalize();
+                request_record.finalize(finalization.clone()).await?;
+                sync_credential_transient_state(state, &selected.model.id, &finalization).await?;
+                return Err(err);
             }
         };
 
-        return build_client_response(status, &response_headers, Body::from_stream(body_stream));
-    }
+        state.record_credential_touch(&selected.model.id).await?;
+        state
+            .update_rate_limits_from_headers(&selected.model.id, response.headers())
+            .await?;
+        let status = response.status();
+        let response_headers = response.headers().clone();
+        let is_event_stream = response_headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.contains("text/event-stream"))
+            .unwrap_or(false);
 
-    let _lease = lease;
-    let body_bytes = match response.bytes().await {
-        Ok(body_bytes) => body_bytes,
-        Err(err) => {
-            let mut observation = RequestObservation::new(requested_model);
-            observation.mark_failure(
-                "upstream_body",
-                Some("body_read_error".to_string()),
-                err.to_string(),
-                Some(i32::from(status.as_u16())),
+        if is_event_stream && status != StatusCode::TOO_MANY_REQUESTS {
+            let state = state.clone();
+            let credential_id = selected.model.id.clone();
+            let body_stream = async_stream::stream! {
+                let _lease = lease;
+                let mut stream = response.bytes_stream();
+                let mut parser = SseEventParser::default();
+                let mut observation = RequestObservation::new(requested_model.clone());
+                let mut request_record = request_record;
+                let mut finalized = false;
+
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            parser.feed(&bytes, &mut observation);
+                            if !finalized && observation.is_terminal() {
+                                let finalization = std::mem::take(&mut observation).finalize();
+                                let _ = request_record.finalize(finalization.clone()).await;
+                                let _ = sync_credential_transient_state(&state, &credential_id, &finalization).await;
+                                finalized = true;
+                            }
+                            yield Result::<Bytes, std::io::Error>::Ok(bytes);
+                        }
+                        Err(err) => {
+                            if !finalized {
+                                observation.mark_failure_if_missing(
+                                    "upstream_stream",
+                                    Some("stream_read_error".to_string()),
+                                    err.to_string(),
+                                    Some(i32::from(status.as_u16())),
+                                );
+                                let finalization = std::mem::take(&mut observation).finalize();
+                                let _ = request_record.finalize(finalization.clone()).await;
+                                let _ = sync_credential_transient_state(&state, &credential_id, &finalization).await;
+                                finalized = true;
+                            }
+                            yield Result::<Bytes, std::io::Error>::Err(std::io::Error::other(err));
+                            break;
+                        }
+                    }
+                }
+
+                if !finalized {
+                    parser.finish(&mut observation);
+                    let finalization = observation.finish_sse_response(status);
+                    let _ = request_record.finalize(finalization.clone()).await;
+                    let _ = sync_credential_transient_state(&state, &credential_id, &finalization).await;
+                }
+            };
+
+            return build_client_response(
+                status,
+                &response_headers,
+                Body::from_stream(body_stream),
             );
-            let finalization = observation.finalize();
-            request_record.finalize(finalization.clone()).await?;
-            sync_credential_transient_state(state, &selected.model.id, &finalization).await?;
-            return Err(AppError::bad_gateway(err.to_string()));
         }
-    };
 
-    let mut observation = RequestObservation::new(requested_model);
-    observation.observe_body_bytes(&body_bytes);
-    let finalization = observation.finish_http_response(status);
-    request_record.finalize(finalization.clone()).await?;
-    sync_credential_transient_state(state, &selected.model.id, &finalization).await?;
+        let _lease = lease;
+        let body_bytes = match response.bytes().await {
+            Ok(body_bytes) => body_bytes,
+            Err(err) => {
+                let mut observation = RequestObservation::new(requested_model.clone());
+                observation.mark_failure(
+                    "upstream_body",
+                    Some("body_read_error".to_string()),
+                    err.to_string(),
+                    Some(i32::from(status.as_u16())),
+                );
+                let finalization = observation.finalize();
+                request_record.finalize(finalization.clone()).await?;
+                sync_credential_transient_state(state, &selected.model.id, &finalization).await?;
+                return Err(AppError::bad_gateway(err.to_string()));
+            }
+        };
 
-    build_client_response(status, &response_headers, Body::from(body_bytes))
+        let mut observation = RequestObservation::new(requested_model.clone());
+        observation.observe_body_bytes(&body_bytes);
+        let finalization = observation.finish_http_response(status);
+        request_record.finalize(finalization.clone()).await?;
+        sync_credential_transient_state(state, &selected.model.id, &finalization).await?;
+
+        if allow_failover && should_failover_to_another_credential(&finalization) {
+            excluded_credentials.insert(selected.model.id.clone());
+            continue;
+        }
+
+        return build_client_response(status, &response_headers, Body::from(body_bytes));
+    }
 }
 
 async fn proxy_responses_ws(
@@ -1306,76 +1282,87 @@ async fn proxy_responses_ws(
 ) -> Result<Response<Body>, AppError> {
     let principal = require_client(&state, &headers).await?;
     let preferred_credential = preferred_credential_from_headers(&headers);
-    let selected = state
-        .select_credential(preferred_credential.as_deref())
-        .await?;
     let client_headers = headers.clone();
-    let credential = selected.model;
-    let credential_id = credential.id.clone();
-    let websocket_prompt_cache_key = resolve_session_key_from_headers(&client_headers)
-        .unwrap_or_else(|| codex_prompt_cache_key(&credential.id));
-    let manager = state.auth_manager(&credential_id).await;
+    let allow_failover = preferred_credential.is_none();
+    let mut excluded_credentials = HashSet::new();
 
-    let upstream =
-        match connect_ws_with_recovery(&state, &credential, &manager, &client_headers).await {
-            Ok(UpstreamWsConnectOutcome::Connected(upstream)) => upstream,
-            Ok(UpstreamWsConnectOutcome::HttpFailure(failure)) => {
-                let mut request_record = start_request_record(
-                    &state,
-                    websocket_request_record_start(principal.clone(), credential.clone(), None),
-                )
-                .await?;
-                state
-                    .update_rate_limits_from_headers(&credential.id, &failure.headers)
+    loop {
+        let selected = state
+            .select_credential(preferred_credential.as_deref(), &excluded_credentials)
+            .await?;
+        let credential = selected.model;
+        let credential_id = credential.id.clone();
+        let manager = state.auth_manager(&credential_id).await;
+
+        let upstream =
+            match connect_ws_with_recovery(&state, &credential, &manager, &client_headers).await {
+                Ok(UpstreamWsConnectOutcome::Connected(upstream)) => upstream,
+                Ok(UpstreamWsConnectOutcome::HttpFailure(failure)) => {
+                    let mut request_record = start_request_record(
+                        &state,
+                        websocket_request_record_start(principal.clone(), credential.clone(), None),
+                    )
                     .await?;
-                let mut observation = RequestObservation::new(None);
-                observation.observe_body_bytes(&failure.body);
-                let finalization = observation.finish_http_response(failure.status);
-                request_record.finalize(finalization.clone()).await?;
-                sync_credential_transient_state(&state, &credential.id, &finalization).await?;
-                return build_client_response(
-                    failure.status,
-                    &failure.headers,
-                    Body::from(failure.body),
-                );
+                    state
+                        .update_rate_limits_from_headers(&credential.id, &failure.headers)
+                        .await?;
+                    let mut observation = RequestObservation::new(None);
+                    observation.observe_body_bytes(&failure.body);
+                    let finalization = observation.finish_http_response(failure.status);
+                    request_record.finalize(finalization.clone()).await?;
+                    sync_credential_transient_state(&state, &credential.id, &finalization).await?;
+
+                    if allow_failover && should_failover_to_another_credential(&finalization) {
+                        excluded_credentials.insert(credential.id.clone());
+                        continue;
+                    }
+
+                    return build_client_response(
+                        failure.status,
+                        &failure.headers,
+                        Body::from(failure.body),
+                    );
+                }
+                Err(err) => {
+                    let mut request_record = start_request_record(
+                        &state,
+                        websocket_request_record_start(principal.clone(), credential.clone(), None),
+                    )
+                    .await?;
+                    let mut observation = RequestObservation::new(None);
+                    observation.mark_failure("upstream_connect", None, err.to_string(), None);
+                    let finalization = observation.finalize();
+                    request_record.finalize(finalization.clone()).await?;
+                    sync_credential_transient_state(&state, &credential.id, &finalization).await?;
+                    return Err(err);
+                }
+            };
+
+        state
+            .update_rate_limits_from_headers(&credential.id, &upstream.response_headers)
+            .await?;
+
+        let upstream_headers = upstream.response_headers.clone();
+        let prompt_cache_key = resolve_session_key_from_headers(&client_headers)
+            .unwrap_or_else(|| codex_prompt_cache_key(&credential.id));
+        let mut response = ws.on_upgrade(move |socket| async move {
+            if let Err(err) = run_ws_proxy(
+                socket,
+                state,
+                principal,
+                credential.clone(),
+                upstream.stream,
+                prompt_cache_key.clone(),
+            )
+            .await
+            {
+                warn!(error = %err, credential_id = %credential_id, "websocket proxy ended with error");
             }
-            Err(err) => {
-                let mut request_record = start_request_record(
-                    &state,
-                    websocket_request_record_start(principal.clone(), credential.clone(), None),
-                )
-                .await?;
-                let mut observation = RequestObservation::new(None);
-                observation.mark_failure("upstream_connect", None, err.to_string(), None);
-                let finalization = observation.finalize();
-                request_record.finalize(finalization.clone()).await?;
-                sync_credential_transient_state(&state, &credential.id, &finalization).await?;
-                return Err(err);
-            }
-        };
+        });
 
-    state
-        .update_rate_limits_from_headers(&credential.id, &upstream.response_headers)
-        .await?;
-
-    let upstream_headers = upstream.response_headers.clone();
-    let mut response = ws.on_upgrade(move |socket| async move {
-        if let Err(err) = run_ws_proxy(
-            socket,
-            state,
-            principal,
-            credential.clone(),
-            upstream.stream,
-            websocket_prompt_cache_key.clone(),
-        )
-        .await
-        {
-            warn!(error = %err, credential_id = %credential_id, "websocket proxy ended with error");
-        }
-    });
-
-    copy_upstream_ws_handshake_headers(response.headers_mut(), &upstream_headers);
-    Ok(response)
+        copy_upstream_ws_handshake_headers(response.headers_mut(), &upstream_headers);
+        return Ok(response);
+    }
 }
 
 async fn run_ws_proxy(
@@ -2536,10 +2523,7 @@ async fn api_key_to_view(state: &AppState, model: api_key::Model) -> Result<ApiK
 }
 
 fn admin_key_to_view(model: admin_key::Model) -> Result<AdminKeyView, AppError> {
-    Ok(AdminKeyView::from_model(
-        model.clone(),
-        model.id == BOOTSTRAP_ADMIN_KEY_ID,
-    ))
+    Ok(AdminKeyView::from_model(model))
 }
 
 fn normalize_pagination(query: &PaginationQuery, default_limit: u64, max_limit: u64) -> (u64, u64) {
@@ -3003,6 +2987,16 @@ async fn sync_credential_transient_state(
         return Ok(());
     }
 
+    if let Some(quota_failure) = quota_failure_from_finalization(finalization) {
+        state
+            .mark_credential_quota_exhausted(
+                credential_id,
+                quota_failure.retry_at,
+                quota_failure.exhausted_credits,
+            )
+            .await?;
+    }
+
     let message = finalization
         .error_message
         .clone()
@@ -3017,6 +3011,86 @@ async fn sync_credential_transient_state(
         .record_credential_error(credential_id, message)
         .await?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QuotaFailure {
+    retry_at: Option<chrono::DateTime<Utc>>,
+    exhausted_credits: bool,
+}
+
+fn should_failover_to_another_credential(finalization: &RequestRecordFinalization) -> bool {
+    quota_failure_from_finalization(finalization).is_some()
+}
+
+fn quota_failure_from_finalization(
+    finalization: &RequestRecordFinalization,
+) -> Option<QuotaFailure> {
+    let error_code = finalization
+        .error_code
+        .as_deref()
+        .map(str::to_ascii_lowercase);
+    let error_message = finalization
+        .error_message
+        .as_deref()
+        .map(str::to_ascii_lowercase);
+
+    let exhausted_credits = matches!(
+        error_code.as_deref(),
+        Some("insufficient_quota" | "quota_exceeded")
+    ) || error_message.as_deref().is_some_and(|message| {
+        message.contains("purchase more credits") || message.contains("current quota")
+    });
+
+    let rate_limited = finalization.upstream_status_code
+        == Some(i32::from(StatusCode::TOO_MANY_REQUESTS.as_u16()))
+        || matches!(error_code.as_deref(), Some("rate_limit_exceeded"));
+
+    if exhausted_credits {
+        return Some(QuotaFailure {
+            retry_at: parse_retry_at_from_error_message(finalization.error_message.as_deref()),
+            exhausted_credits: true,
+        });
+    }
+
+    if rate_limited {
+        return Some(QuotaFailure {
+            retry_at: parse_retry_at_from_error_message(finalization.error_message.as_deref())
+                .or_else(default_retry_at_after_rate_limit),
+            exhausted_credits: false,
+        });
+    }
+
+    None
+}
+
+fn parse_retry_at_from_error_message(message: Option<&str>) -> Option<chrono::DateTime<Utc>> {
+    let message = message?;
+    let lower = message.to_ascii_lowercase();
+    let marker = "try again in ";
+    let start = lower.find(marker)? + marker.len();
+    let tail = &lower[start..];
+
+    let mut end = 0_usize;
+    for ch in tail.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            end += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+
+    let seconds = tail[..end].parse::<f64>().ok()?;
+    chrono::Duration::from_std(std::time::Duration::from_secs_f64(seconds))
+        .ok()
+        .and_then(|delay| Utc::now().checked_add_signed(delay))
+}
+
+fn default_retry_at_after_rate_limit() -> Option<chrono::DateTime<Utc>> {
+    Utc::now().checked_add_signed(chrono::Duration::seconds(60))
 }
 
 fn ui_dist_dir() -> PathBuf {
@@ -3444,7 +3518,6 @@ mod tests {
             data_dir: PathBuf::from("/tmp/codex-proxy"),
             database_url: "sqlite::memory:".to_string(),
             admin_password_hash: "hash".to_string(),
-            admin_key_hash: "hash".to_string(),
             chatgpt_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             auth_issuer: "https://auth.openai.com".to_string(),
             auth_client_id: "client".to_string(),
@@ -3471,5 +3544,57 @@ mod tests {
                 .expect("websocket url should build"),
             "ws://localhost:8787/responses"
         );
+    }
+
+    #[test]
+    fn retry_at_is_parsed_from_rate_limit_message() {
+        let retry_at = parse_retry_at_from_error_message(Some(
+            "Rate limit reached. Please try again in 11.054s.",
+        ))
+        .expect("retry time should parse");
+
+        let seconds = (retry_at - Utc::now()).num_milliseconds() as f64 / 1000.0;
+        assert!(
+            (10.0..=12.5).contains(&seconds),
+            "expected retry window near 11 seconds, got {seconds}"
+        );
+    }
+
+    #[test]
+    fn insufficient_quota_failure_triggers_failover() {
+        let finalization = RequestRecordFinalization {
+            upstream_status_code: Some(429),
+            request_success: false,
+            error_phase: Some("upstream_response".to_string()),
+            error_code: Some("insufficient_quota".to_string()),
+            error_message: Some("You exceeded your current quota.".to_string()),
+            response_id: None,
+            requested_model: None,
+            usage: None,
+            usage_json: None,
+        };
+
+        let quota_failure = quota_failure_from_finalization(&finalization)
+            .expect("quota failure should be detected");
+        assert!(quota_failure.exhausted_credits);
+        assert!(should_failover_to_another_credential(&finalization));
+    }
+
+    #[test]
+    fn ordinary_upstream_failures_do_not_trigger_failover() {
+        let finalization = RequestRecordFinalization {
+            upstream_status_code: Some(500),
+            request_success: false,
+            error_phase: Some("upstream_http_status".to_string()),
+            error_code: None,
+            error_message: Some("upstream returned 500".to_string()),
+            response_id: None,
+            requested_model: None,
+            usage: None,
+            usage_json: None,
+        };
+
+        assert!(quota_failure_from_finalization(&finalization).is_none());
+        assert!(!should_failover_to_another_credential(&finalization));
     }
 }

@@ -32,9 +32,6 @@ pub struct Args {
     #[arg(long, env = "CODEX_PROXY_ADMIN_PASSWORD")]
     pub admin_password: String,
 
-    #[arg(long, env = "CODEX_PROXY_ADMIN_KEY")]
-    pub admin_key: String,
-
     #[arg(
         long,
         env = "CODEX_PROXY_CHATGPT_BASE_URL",
@@ -76,7 +73,6 @@ pub struct AppConfig {
     pub data_dir: PathBuf,
     pub database_url: String,
     pub admin_password_hash: String,
-    pub admin_key_hash: String,
     pub chatgpt_base_url: String,
     pub auth_issuer: String,
     pub auth_client_id: String,
@@ -103,7 +99,6 @@ impl Args {
             data_dir,
             database_url,
             admin_password_hash: hash_secret(&self.admin_password),
-            admin_key_hash: hash_secret(&self.admin_key),
             chatgpt_base_url: normalize_string_or_default(
                 self.chatgpt_base_url,
                 DEFAULT_CHATGPT_BASE_URL,
@@ -253,7 +248,6 @@ mod tests {
             data_dir: PathBuf::from("/tmp/codex-proxy"),
             database_url: Some("   ".to_string()),
             admin_password: "secret".to_string(),
-            admin_key: "secret".to_string(),
             chatgpt_base_url: "  https://chatgpt.com/backend-api/codex  ".to_string(),
             auth_issuer: "  https://auth.openai.com/  ".to_string(),
             auth_client_id: format!("  {CLIENT_ID}  "),
@@ -286,7 +280,6 @@ mod tests {
             data_dir: PathBuf::from("/tmp/codex-proxy"),
             database_url: None,
             admin_password: "secret".to_string(),
-            admin_key: "secret".to_string(),
             chatgpt_base_url: DEFAULT_CHATGPT_BASE_URL.to_string(),
             auth_issuer: DEFAULT_AUTH_ISSUER.to_string(),
             auth_client_id: CLIENT_ID.to_string(),
@@ -313,7 +306,6 @@ mod tests {
             data_dir: PathBuf::from("test-data"),
             database_url: None,
             admin_password: "secret".to_string(),
-            admin_key: "secret".to_string(),
             chatgpt_base_url: DEFAULT_CHATGPT_BASE_URL.to_string(),
             auth_issuer: DEFAULT_AUTH_ISSUER.to_string(),
             auth_client_id: CLIENT_ID.to_string(),
@@ -339,7 +331,6 @@ mod tests {
             data_dir: PathBuf::from("/tmp/codex-proxy"),
             database_url: None,
             admin_password: "secret".to_string(),
-            admin_key: "secret".to_string(),
             chatgpt_base_url: DEFAULT_CHATGPT_BASE_URL.to_string(),
             auth_issuer: DEFAULT_AUTH_ISSUER.to_string(),
             auth_client_id: CLIENT_ID.to_string(),
@@ -365,7 +356,6 @@ mod tests {
             data_dir: PathBuf::from("/tmp/codex-proxy"),
             database_url: None,
             admin_password: "secret".to_string(),
-            admin_key: "secret".to_string(),
             chatgpt_base_url: DEFAULT_CHATGPT_BASE_URL.to_string(),
             auth_issuer: DEFAULT_AUTH_ISSUER.to_string(),
             auth_client_id: CLIENT_ID.to_string(),

@@ -194,7 +194,6 @@ export interface AdminKeyView {
   admin_key_id: string
   admin_key_name: string
   is_enabled: boolean
-  is_bootstrap: boolean
   admin_key_expires_at: string | null
   last_admin_key_used_at: string | null
   admin_key_created_at: string

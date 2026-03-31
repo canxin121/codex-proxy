@@ -161,7 +161,6 @@ jobs:
             --bind "127.0.0.1:${port}" \
             --data-dir "${data_dir}" \
             --admin-password "test-admin-password" \
-            --admin-key "test-admin-key" \
             >"${data_dir}/server.log" 2>&1 &
           pid=$!
 
