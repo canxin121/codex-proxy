@@ -93,6 +93,13 @@ const maxValue = computed(() =>
 
 const valueSpan = computed(() => Math.max(maxValue.value, 1))
 
+function pointXAt(index: number) {
+  if (pointCount.value <= 1) {
+    return chartLeft + chartWidth / 2
+  }
+  return chartLeft + (chartWidth * index) / (pointCount.value - 1)
+}
+
 function smoothPath(dataset: Array<{ x: number; y: number }>, tension = 0.86): string {
   if (!dataset.length) {
     return ''
@@ -120,12 +127,11 @@ function smoothPath(dataset: Array<{ x: number; y: number }>, tension = 0.86): s
 }
 
 const projectedSeries = computed(() => {
-  const denominator = Math.max(pointCount.value - 1, 1)
   return visibleSeries.value.map((series) => {
     const points = labels.value.map((label, index) => {
       const source = series.points[index]
       const value = source?.value ?? 0
-      const x = chartLeft + (chartWidth * index) / denominator
+      const x = pointXAt(index)
       const y = chartTop + ((maxValue.value - value) / valueSpan.value) * chartHeight
       return {
         x,
@@ -161,10 +167,7 @@ const activeX = computed(() => {
   if (activeIndex.value === null) {
     return null
   }
-  if (pointCount.value === 1) {
-    return chartLeft + chartWidth / 2
-  }
-  return chartLeft + (chartWidth * activeIndex.value) / (pointCount.value - 1)
+  return pointXAt(activeIndex.value)
 })
 
 const activeTooltipRows = computed(() => {
