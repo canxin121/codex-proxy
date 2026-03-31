@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   install-linux:
-    name: Install and smoke test on Linux (musl first)
+    name: Install, update, uninstall smoke test on Linux
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -89,6 +89,7 @@ jobs:
           set -euo pipefail
           test -x "${{ steps.install.outputs.bin_path }}"
           test -f "${{ steps.install.outputs.ui_dist }}/index.html"
+          test -f "${{ steps.install.outputs.install_root }}/share/codex-proxy/install-metadata.env"
 
       - name: Verify release has musl artifact
         shell: bash
@@ -121,6 +122,30 @@ jobs:
           grep -q "x86_64-unknown-linux-gnu" "${log_file}"
           test -x "${bin_dir}/codex-proxy"
           test -f "${share_dir}/codex-proxy/ui/dist/index.html"
+
+      - name: Verify update script works
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.vars.outputs.tag }}"
+          repo="${{ github.repository }}"
+          install_root="${{ steps.install.outputs.install_root }}"
+          bin_dir="${install_root}/bin"
+          share_dir="${install_root}/share/codex-proxy"
+          log_file="${install_root}/update.log"
+
+          curl -fsSL "https://raw.githubusercontent.com/${repo}/${tag}/scripts/update.sh" \
+            | CODEX_PROXY_REPO="${repo}" \
+              CODEX_PROXY_VERSION="${tag}" \
+              CODEX_PROXY_SCRIPT_REF="${tag}" \
+              CODEX_PROXY_INSTALL_BIN_DIR="${bin_dir}" \
+              CODEX_PROXY_INSTALL_SHARE_DIR="${share_dir}" \
+              bash | tee "${log_file}"
+
+          grep -q "Updating codex-proxy using" "${log_file}"
+          test -x "${bin_dir}/codex-proxy"
+          test -f "${share_dir}/ui/dist/index.html"
+          test -f "${share_dir}/install-metadata.env"
 
       - name: Smoke run service
         shell: bash
@@ -158,3 +183,23 @@ jobs:
           curl -fsS "http://127.0.0.1:${port}/healthz" >/dev/null
           curl -fsS "http://127.0.0.1:${port}/readyz" >/dev/null
           curl -fsS "http://127.0.0.1:${port}/" | grep -qi "<html"
+
+      - name: Verify uninstall script works
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.vars.outputs.tag }}"
+          repo="${{ github.repository }}"
+          install_root="${{ steps.install.outputs.install_root }}"
+          bin_dir="${install_root}/bin"
+          share_dir="${install_root}/share/codex-proxy"
+          log_file="${install_root}/uninstall.log"
+
+          curl -fsSL "https://raw.githubusercontent.com/${repo}/${tag}/scripts/uninstall.sh" \
+            | CODEX_PROXY_INSTALL_BIN_DIR="${bin_dir}" \
+              CODEX_PROXY_INSTALL_SHARE_DIR="${share_dir}" \
+              bash | tee "${log_file}"
+
+          grep -q "Uninstalled codex-proxy." "${log_file}"
+          test ! -e "${bin_dir}/codex-proxy"
+          test ! -d "${share_dir}"

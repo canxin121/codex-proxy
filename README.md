@@ -73,6 +73,37 @@ CODEX_PROXY_INSTALL_SHARE_DIR=/usr/local/share/codex-proxy \
 curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh | bash
 ```
 
+## Update (One-Liner)
+
+Update to the latest GitHub Release with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/update.sh | bash
+```
+
+Update to a specific release tag:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/update.sh | CODEX_PROXY_VERSION=v0.1.0 bash
+```
+
+`update.sh` reuses the same install-path environment variables as `install.sh`.
+
+## Uninstall (One-Liner)
+
+Remove the installed binary and frontend assets:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/uninstall.sh | bash
+```
+
+Optional: also remove your runtime data directory explicitly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/uninstall.sh \
+  | CODEX_PROXY_REMOVE_DATA_DIR=1 CODEX_PROXY_DATA_DIR=/path/to/codex-proxy-data bash
+```
+
 ## Frontend console
 
 `codex-proxy` also ships with a Vue 3 admin console under `ui/`.
@@ -178,8 +209,9 @@ This repo includes GitHub Actions workflows for CI and Release:
   - publishes both Linux musl and Linux gnu artifacts, with musl as the primary distribution target
 - Post-release install verification: `.github/workflows/release-install-test.yml`
   - triggers on `release.published` (and manual `workflow_dispatch`)
-  - downloads installer script from the exact release tag
-  - runs real install against GitHub Release assets
+  - also auto-runs after the `Release` workflow completes successfully
+  - downloads release scripts from the exact tag being validated
+  - runs real install, update, and uninstall flows against GitHub Release assets
   - verifies installed binary + UI files and performs runtime smoke checks (`/healthz`, `/readyz`, `/`)
 
 Create a release by tagging and pushing:

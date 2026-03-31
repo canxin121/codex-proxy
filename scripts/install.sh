@@ -21,6 +21,24 @@ cleanup_tmp_dir() {
   fi
 }
 
+write_install_metadata() {
+  local metadata_path selected_target bin_path ui_dist_path
+  metadata_path="$1"
+  selected_target="$2"
+  bin_path="$3"
+  ui_dist_path="$4"
+
+  {
+    printf 'CODEX_PROXY_REPO=%q\n' "${REPO}"
+    printf 'CODEX_PROXY_VERSION=%q\n' "${VERSION}"
+    printf 'CODEX_PROXY_TARGET=%q\n' "${selected_target}"
+    printf 'CODEX_PROXY_INSTALL_BIN_DIR=%q\n' "${INSTALL_BIN_DIR}"
+    printf 'CODEX_PROXY_INSTALL_SHARE_DIR=%q\n' "${INSTALL_SHARE_DIR}"
+    printf 'CODEX_PROXY_BIN_PATH=%q\n' "${bin_path}"
+    printf 'CODEX_PROXY_UI_DIST=%q\n' "${ui_dist_path}"
+  } > "${metadata_path}"
+}
+
 detect_target_candidates() {
   local os arch
   os="$(uname -s)"
@@ -156,12 +174,19 @@ main() {
     cp -R "${ui_src}" "${ui_dst}"
   fi
 
+  write_install_metadata \
+    "${INSTALL_SHARE_DIR}/install-metadata.env" \
+    "${selected_target}" \
+    "${bin_dst}" \
+    "${ui_dst}"
+
   echo
   echo "Installed codex-proxy ${VERSION} (${selected_target})"
   echo "  binary: ${bin_dst}"
   if [[ -d "${ui_dst}" ]]; then
     echo "  ui dist: ${ui_dst}"
   fi
+  echo "  metadata: ${INSTALL_SHARE_DIR}/install-metadata.env"
   echo
   if [[ ":${PATH}:" != *":${INSTALL_BIN_DIR}:"* ]]; then
     echo "Add ${INSTALL_BIN_DIR} to PATH:"
