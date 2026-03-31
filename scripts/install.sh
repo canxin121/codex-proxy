@@ -1,12 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="${CODEX_PROXY_REPO:-canxin121/codex-proxy}"
-VERSION="${CODEX_PROXY_VERSION:-}"
-TARGET_OVERRIDE="${CODEX_PROXY_TARGET:-}"
-INSTALL_BIN_DIR="${CODEX_PROXY_INSTALL_BIN_DIR:-$HOME/.local/bin}"
-INSTALL_SHARE_DIR="${CODEX_PROXY_INSTALL_SHARE_DIR:-$HOME/.local/share/codex-proxy}"
+REPO="canxin121/codex-proxy"
+VERSION=""
+TARGET_OVERRIDE=""
+INSTALL_BIN_DIR="${HOME}/.local/bin"
+INSTALL_SHARE_DIR="${HOME}/.local/share/codex-proxy"
+RUNTIME_ARGS=()
 CLEANUP_TMP_DIR=""
+
+usage() {
+  cat <<'EOF'
+Usage:
+  install.sh [installer-options] [-- codex-proxy-runtime-args...]
+
+Installer options:
+  --repo <owner/name>          GitHub repository to download from
+  --version <tag>              Release tag to install, for example v0.1.0
+  --target <triple>            Force a specific release target
+  --install-bin-dir <path>     Directory for the user-facing launcher
+  --install-share-dir <path>   Directory for shared files and the real binary
+  -h, --help                   Show this help
+
+Everything after `--` is persisted and used as default arguments whenever the
+installed `codex-proxy` launcher runs.
+
+Example:
+  curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh \
+    | bash -s -- \
+        --version v0.1.0 \
+        --install-bin-dir "$HOME/.local/bin" \
+        --install-share-dir "$HOME/.local/share/codex-proxy" \
+        -- \
+        --bind 127.0.0.1:8787 \
+        --data-dir "$HOME/.local/share/codex-proxy/data" \
+        --admin-password 'change-me'
+EOF
+}
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -21,22 +51,80 @@ cleanup_tmp_dir() {
   fi
 }
 
-write_install_metadata() {
-  local metadata_path selected_target bin_path ui_dist_path
-  metadata_path="$1"
-  selected_target="$2"
-  bin_path="$3"
-  ui_dist_path="$4"
+require_option_value() {
+  local option="$1"
+  local value="${2:-}"
+  if [[ -z "${value}" ]]; then
+    echo "error: ${option} requires a value" >&2
+    exit 1
+  fi
+}
 
-  {
-    printf 'CODEX_PROXY_REPO=%q\n' "${REPO}"
-    printf 'CODEX_PROXY_VERSION=%q\n' "${VERSION}"
-    printf 'CODEX_PROXY_TARGET=%q\n' "${selected_target}"
-    printf 'CODEX_PROXY_INSTALL_BIN_DIR=%q\n' "${INSTALL_BIN_DIR}"
-    printf 'CODEX_PROXY_INSTALL_SHARE_DIR=%q\n' "${INSTALL_SHARE_DIR}"
-    printf 'CODEX_PROXY_BIN_PATH=%q\n' "${bin_path}"
-    printf 'CODEX_PROXY_UI_DIST=%q\n' "${ui_dist_path}"
-  } > "${metadata_path}"
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --repo)
+        require_option_value "$1" "${2:-}"
+        REPO="$2"
+        shift 2
+        ;;
+      --repo=*)
+        REPO="${1#*=}"
+        shift
+        ;;
+      --version)
+        require_option_value "$1" "${2:-}"
+        VERSION="$2"
+        shift 2
+        ;;
+      --version=*)
+        VERSION="${1#*=}"
+        shift
+        ;;
+      --target)
+        require_option_value "$1" "${2:-}"
+        TARGET_OVERRIDE="$2"
+        shift 2
+        ;;
+      --target=*)
+        TARGET_OVERRIDE="${1#*=}"
+        shift
+        ;;
+      --install-bin-dir)
+        require_option_value "$1" "${2:-}"
+        INSTALL_BIN_DIR="$2"
+        shift 2
+        ;;
+      --install-bin-dir=*)
+        INSTALL_BIN_DIR="${1#*=}"
+        shift
+        ;;
+      --install-share-dir)
+        require_option_value "$1" "${2:-}"
+        INSTALL_SHARE_DIR="$2"
+        shift 2
+        ;;
+      --install-share-dir=*)
+        INSTALL_SHARE_DIR="${1#*=}"
+        shift
+        ;;
+      --)
+        shift
+        RUNTIME_ARGS=("$@")
+        return 0
+        ;;
+      *)
+        echo "error: unknown option: $1" >&2
+        echo >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
 }
 
 detect_target_candidates() {
@@ -48,7 +136,6 @@ detect_target_candidates() {
     Linux)
       case "${arch}" in
         x86_64|amd64)
-          # Prefer musl for better cross-distro runtime compatibility.
           echo "x86_64-unknown-linux-musl"
           echo "x86_64-unknown-linux-gnu"
           ;;
@@ -61,7 +148,9 @@ detect_target_candidates() {
       ;;
     Darwin)
       case "${arch}" in
-        x86_64|amd64) echo "x86_64-apple-darwin" ;;
+        x86_64|amd64)
+          echo "x86_64-apple-darwin"
+          ;;
         *)
           echo "error: unsupported macOS architecture: ${arch}" >&2
           echo "supported: x86_64" >&2
@@ -104,13 +193,122 @@ download_archive() {
   return 1
 }
 
+write_runtime_args() {
+  local runtime_args_path="$1"
+  shift
+
+  {
+    echo "CODEX_PROXY_RUNTIME_ARGS=("
+    for arg in "$@"; do
+      printf '  %q\n' "${arg}"
+    done
+    echo ")"
+  } > "${runtime_args_path}"
+
+  chmod 600 "${runtime_args_path}"
+}
+
+write_launcher_script() {
+  local wrapper_path="$1"
+  local real_bin_path="$2"
+  local runtime_args_path="$3"
+  local ui_dist_path="$4"
+
+  cat > "${wrapper_path}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+CODEX_PROXY_REAL_BIN_PATH=$(printf '%q' "${real_bin_path}")
+CODEX_PROXY_RUNTIME_ARGS_FILE=$(printf '%q' "${runtime_args_path}")
+CODEX_PROXY_UI_DIST=$(printf '%q' "${ui_dist_path}")
+
+declare -a CODEX_PROXY_RUNTIME_ARGS=()
+if [[ -f "\${CODEX_PROXY_RUNTIME_ARGS_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  . "\${CODEX_PROXY_RUNTIME_ARGS_FILE}"
+fi
+
+export CODEX_PROXY_UI_DIST_DIR="\${CODEX_PROXY_UI_DIST}"
+exec "\${CODEX_PROXY_REAL_BIN_PATH}" "\${CODEX_PROXY_RUNTIME_ARGS[@]}" "\$@"
+EOF
+
+  chmod +x "${wrapper_path}"
+}
+
+write_install_metadata() {
+  local metadata_path="$1"
+  local selected_target="$2"
+  local wrapper_path="$3"
+  local real_bin_path="$4"
+  local ui_dist_path="$5"
+  local runtime_args_path="$6"
+
+  {
+    printf 'CODEX_PROXY_METADATA_REPO=%q\n' "${REPO}"
+    printf 'CODEX_PROXY_METADATA_VERSION=%q\n' "${VERSION}"
+    printf 'CODEX_PROXY_METADATA_TARGET=%q\n' "${selected_target}"
+    printf 'CODEX_PROXY_METADATA_INSTALL_BIN_DIR=%q\n' "${INSTALL_BIN_DIR}"
+    printf 'CODEX_PROXY_METADATA_INSTALL_SHARE_DIR=%q\n' "${INSTALL_SHARE_DIR}"
+    printf 'CODEX_PROXY_METADATA_WRAPPER_PATH=%q\n' "${wrapper_path}"
+    printf 'CODEX_PROXY_METADATA_REAL_BIN_PATH=%q\n' "${real_bin_path}"
+    printf 'CODEX_PROXY_METADATA_UI_DIST=%q\n' "${ui_dist_path}"
+    printf 'CODEX_PROXY_METADATA_RUNTIME_ARGS_FILE=%q\n' "${runtime_args_path}"
+  } > "${metadata_path}"
+
+  chmod 600 "${metadata_path}"
+}
+
+print_runtime_args() {
+  local -a rendered
+  local index arg next
+
+  if [[ "${#RUNTIME_ARGS[@]}" -eq 0 ]]; then
+    echo "  saved runtime args: (none)"
+    return 0
+  fi
+
+  rendered=()
+  index=0
+  while [[ "${index}" -lt "${#RUNTIME_ARGS[@]}" ]]; do
+    arg="${RUNTIME_ARGS[${index}]}"
+    case "${arg}" in
+      --admin-password|--database-url)
+        rendered+=("${arg}")
+        next="<missing>"
+        if [[ $((index + 1)) -lt "${#RUNTIME_ARGS[@]}" ]]; then
+          next="<redacted>"
+          index=$((index + 2))
+        else
+          index=$((index + 1))
+        fi
+        rendered+=("${next}")
+        ;;
+      --admin-password=*|--database-url=*)
+        rendered+=("${arg%%=*}=<redacted>")
+        index=$((index + 1))
+        ;;
+      *)
+        rendered+=("${arg}")
+        index=$((index + 1))
+        ;;
+    esac
+  done
+
+  printf '  saved runtime args:'
+  printf ' %q' "${rendered[@]}"
+  printf '\n'
+}
+
 main() {
+  local ext archive_name tmp_dir pkg_root selected_target download_result
+  local real_bin_src real_bin_dst wrapper_dst ui_src ui_dst runtime_args_path metadata_path
+  local -a target_candidates
+
+  parse_args "$@"
+
   need_cmd curl
   need_cmd tar
   need_cmd mktemp
-
-  local ext archive_name tmp_dir pkg_root bin_src bin_dst ui_src ui_dst selected_target download_result
-  local -a target_candidates
 
   ext="tar.gz"
 
@@ -154,47 +352,70 @@ main() {
     exit 1
   fi
 
-  bin_src="${pkg_root}/codex-proxy"
-  if [[ ! -f "${bin_src}" ]]; then
-    echo "error: binary not found in archive: ${bin_src}" >&2
+  real_bin_src="${pkg_root}/codex-proxy"
+  if [[ ! -f "${real_bin_src}" ]]; then
+    echo "error: binary not found in archive: ${real_bin_src}" >&2
     exit 1
   fi
 
   mkdir -p "${INSTALL_BIN_DIR}"
+  mkdir -p "${INSTALL_SHARE_DIR}/bin"
   mkdir -p "${INSTALL_SHARE_DIR}/ui"
 
-  bin_dst="${INSTALL_BIN_DIR}/codex-proxy"
-  cp "${bin_src}" "${bin_dst}"
-  chmod +x "${bin_dst}"
-
+  real_bin_dst="${INSTALL_SHARE_DIR}/bin/codex-proxy"
+  wrapper_dst="${INSTALL_BIN_DIR}/codex-proxy"
   ui_src="${pkg_root}/ui/dist"
   ui_dst="${INSTALL_SHARE_DIR}/ui/dist"
+  runtime_args_path="${INSTALL_SHARE_DIR}/runtime-args.sh"
+  metadata_path="${INSTALL_SHARE_DIR}/install-metadata.env"
+
+  cp "${real_bin_src}" "${real_bin_dst}"
+  chmod +x "${real_bin_dst}"
+
   if [[ -d "${ui_src}" ]]; then
     rm -rf "${ui_dst}"
     cp -R "${ui_src}" "${ui_dst}"
   fi
 
+  write_runtime_args "${runtime_args_path}" "${RUNTIME_ARGS[@]}"
+  write_launcher_script "${wrapper_dst}" "${real_bin_dst}" "${runtime_args_path}" "${ui_dst}"
   write_install_metadata \
-    "${INSTALL_SHARE_DIR}/install-metadata.env" \
+    "${metadata_path}" \
     "${selected_target}" \
-    "${bin_dst}" \
-    "${ui_dst}"
+    "${wrapper_dst}" \
+    "${real_bin_dst}" \
+    "${ui_dst}" \
+    "${runtime_args_path}"
 
   echo
   echo "Installed codex-proxy ${VERSION} (${selected_target})"
-  echo "  binary: ${bin_dst}"
+  echo "  launcher: ${wrapper_dst}"
+  echo "  real binary: ${real_bin_dst}"
   if [[ -d "${ui_dst}" ]]; then
     echo "  ui dist: ${ui_dst}"
   fi
-  echo "  metadata: ${INSTALL_SHARE_DIR}/install-metadata.env"
+  echo "  runtime args file: ${runtime_args_path}"
+  echo "  metadata: ${metadata_path}"
+  print_runtime_args
+  echo
+  echo "Installed launcher runs as the current user. No system-level service was created."
   echo
   if [[ ":${PATH}:" != *":${INSTALL_BIN_DIR}:"* ]]; then
     echo "Add ${INSTALL_BIN_DIR} to PATH:"
     echo "  export PATH=\"${INSTALL_BIN_DIR}:\$PATH\""
     echo
   fi
-  echo "Optional: force UI path explicitly:"
-  echo "  export CODEX_PROXY_UI_DIST_DIR=\"${ui_dst}\""
+  if [[ "${#RUNTIME_ARGS[@]}" -eq 0 ]]; then
+    echo "No default runtime args were saved."
+    echo "Run manually when needed, for example:"
+    echo "  ${wrapper_dst} --bind 127.0.0.1:8787 --data-dir ${INSTALL_SHARE_DIR}/data --admin-password change-me"
+  else
+    echo "Start the proxy with the saved args:"
+    echo "  ${wrapper_dst}"
+    echo
+    echo "Additional CLI args are appended after the saved args."
+    echo "If you need to change a saved option such as --bind or --data-dir, rerun update.sh with a new runtime-args section."
+  fi
 }
 
 main "$@"

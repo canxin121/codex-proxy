@@ -37,10 +37,15 @@ git submodule update --init --depth 1
 
 ## Install (One-Liner)
 
-For Linux/macOS (x86_64), install the latest GitHub Release with:
+For Linux/macOS (x86_64), install the latest GitHub Release and persist the
+same runtime flags you would normally pass to `cargo run --`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh \
+  | bash -s -- -- \
+      --bind 127.0.0.1:8787 \
+      --data-dir "$HOME/.local/share/codex-proxy/data" \
+      --admin-password 'change-me'
 ```
 
 Linux installer behavior:
@@ -48,60 +53,114 @@ Linux installer behavior:
 - tries `x86_64-unknown-linux-musl` first (recommended default for cross-distro compatibility)
 - falls back to `x86_64-unknown-linux-gnu` if musl asset is unavailable for that tag
 
+Everything after the installer `--` separator is saved and reused whenever the
+installed `codex-proxy` launcher runs.
+
 Install a specific release tag:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh | CODEX_PROXY_VERSION=v0.1.0 bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh \
+  | bash -s -- --version v0.1.0 -- \
+      --bind 127.0.0.1:8787 \
+      --data-dir "$HOME/.local/share/codex-proxy/data" \
+      --admin-password 'change-me'
 ```
 
 Force a specific target when needed:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh | CODEX_PROXY_TARGET=x86_64-unknown-linux-musl bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh \
+  | bash -s -- --target x86_64-unknown-linux-musl -- \
+      --bind 127.0.0.1:8787 \
+      --data-dir "$HOME/.local/share/codex-proxy/data" \
+      --admin-password 'change-me'
 ```
 
 By default, the installer writes:
 
-- binary: `~/.local/bin/codex-proxy`
+- launcher: `~/.local/bin/codex-proxy`
+- real binary: `~/.local/share/codex-proxy/bin/codex-proxy`
 - frontend assets: `~/.local/share/codex-proxy/ui/dist`
+- saved runtime args: `~/.local/share/codex-proxy/runtime-args.sh`
+
+After installation, run `codex-proxy` directly. The launcher reuses the saved
+runtime args automatically.
+
+If you need to change saved options such as `--bind`, `--data-dir`, or
+`--admin-password`, rerun `update.sh` with a new runtime-args section instead
+of passing duplicate flags to the launcher.
 
 Override install paths if needed:
 
 ```bash
-CODEX_PROXY_INSTALL_BIN_DIR=/usr/local/bin \
-CODEX_PROXY_INSTALL_SHARE_DIR=/usr/local/share/codex-proxy \
-curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh \
+  | bash -s -- \
+      --install-bin-dir /usr/local/bin \
+      --install-share-dir /usr/local/share/codex-proxy \
+      -- \
+      --bind 127.0.0.1:8787 \
+      --data-dir /usr/local/share/codex-proxy/data \
+      --admin-password 'change-me'
 ```
+
+The installer only creates user-space files. It does not create a system-level
+service.
+
+Note: saved runtime args are stored on disk so the launcher can reuse them.
+That includes secrets such as `--admin-password`. The script writes those files
+with user-only permissions.
 
 ## Update (One-Liner)
 
 Update to the latest GitHub Release with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/update.sh | bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/update.sh \
+  | bash -s --
 ```
 
 Update to a specific release tag:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/update.sh | CODEX_PROXY_VERSION=v0.1.0 bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/update.sh \
+  | bash -s -- --version v0.1.0
 ```
 
-`update.sh` reuses the same install-path environment variables as `install.sh`.
+Replace the saved runtime args during update:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/update.sh \
+  | bash -s -- --version v0.1.0 -- \
+      --bind 127.0.0.1:8787 \
+      --data-dir "$HOME/.local/share/codex-proxy/data" \
+      --admin-password 'new-password'
+```
+
+If no runtime args are passed after `--`, `update.sh` reuses the already saved
+runtime args from the existing installation.
 
 ## Uninstall (One-Liner)
 
 Remove the installed binary and frontend assets:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/uninstall.sh \
+  | bash -s --
 ```
 
-Optional: also remove your runtime data directory explicitly:
+Optional: also remove your runtime data directory. If the launcher already has a
+saved `--data-dir`, the uninstall script can infer it automatically:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/uninstall.sh \
-  | CODEX_PROXY_REMOVE_DATA_DIR=1 CODEX_PROXY_DATA_DIR=/path/to/codex-proxy-data bash
+  | bash -s -- --remove-data-dir
+```
+
+Or provide the data dir explicitly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/uninstall.sh \
+  | bash -s -- --remove-data-dir --data-dir /path/to/codex-proxy-data
 ```
 
 ## Frontend console

@@ -66,30 +66,41 @@ jobs:
           install_root="$(mktemp -d)"
           bin_dir="${install_root}/bin"
           share_dir="${install_root}/share"
+          data_dir="${install_root}/data"
+          port=18787
           log_file="${install_root}/install.log"
 
           echo "Using install root: ${install_root}"
           curl -fsSL "https://raw.githubusercontent.com/${repo}/${tag}/scripts/install.sh" \
-            | CODEX_PROXY_REPO="${repo}" \
-              CODEX_PROXY_VERSION="${tag}" \
-              CODEX_PROXY_INSTALL_BIN_DIR="${bin_dir}" \
-              CODEX_PROXY_INSTALL_SHARE_DIR="${share_dir}/codex-proxy" \
-              bash | tee "${log_file}"
+            | bash -s -- \
+                --repo "${repo}" \
+                --version "${tag}" \
+                --install-bin-dir "${bin_dir}" \
+                --install-share-dir "${share_dir}/codex-proxy" \
+                -- \
+                --bind "127.0.0.1:${port}" \
+                --data-dir "${data_dir}" \
+                --admin-password "test-admin-password" | tee "${log_file}"
 
-          "${bin_dir}/codex-proxy" --version >/dev/null 2>&1 || true
           grep -q "x86_64-unknown-linux-musl" "${log_file}"
+          grep -q "saved runtime args:" "${log_file}"
+          grep -q -- "--admin-password" "${share_dir}/codex-proxy/runtime-args.sh"
 
           echo "install_root=${install_root}" >> "$GITHUB_OUTPUT"
           echo "bin_path=${bin_dir}/codex-proxy" >> "$GITHUB_OUTPUT"
           echo "ui_dist=${share_dir}/codex-proxy/ui/dist" >> "$GITHUB_OUTPUT"
+          echo "data_dir=${data_dir}" >> "$GITHUB_OUTPUT"
+          echo "port=${port}" >> "$GITHUB_OUTPUT"
 
       - name: Verify installed files
         shell: bash
         run: |
           set -euo pipefail
           test -x "${{ steps.install.outputs.bin_path }}"
+          test -x "${{ steps.install.outputs.install_root }}/share/codex-proxy/bin/codex-proxy"
           test -f "${{ steps.install.outputs.ui_dist }}/index.html"
           test -f "${{ steps.install.outputs.install_root }}/share/codex-proxy/install-metadata.env"
+          test -f "${{ steps.install.outputs.install_root }}/share/codex-proxy/runtime-args.sh"
 
       - name: Verify release has musl artifact
         shell: bash
@@ -109,18 +120,24 @@ jobs:
           install_root="$(mktemp -d)"
           bin_dir="${install_root}/bin"
           share_dir="${install_root}/share"
+          data_dir="${install_root}/data"
           log_file="${install_root}/install-gnu.log"
 
           curl -fsSL "https://raw.githubusercontent.com/${repo}/${tag}/scripts/install.sh" \
-            | CODEX_PROXY_REPO="${repo}" \
-              CODEX_PROXY_VERSION="${tag}" \
-              CODEX_PROXY_TARGET="x86_64-unknown-linux-gnu" \
-              CODEX_PROXY_INSTALL_BIN_DIR="${bin_dir}" \
-              CODEX_PROXY_INSTALL_SHARE_DIR="${share_dir}/codex-proxy" \
-              bash | tee "${log_file}"
+            | bash -s -- \
+                --repo "${repo}" \
+                --version "${tag}" \
+                --target "x86_64-unknown-linux-gnu" \
+                --install-bin-dir "${bin_dir}" \
+                --install-share-dir "${share_dir}/codex-proxy" \
+                -- \
+                --bind "127.0.0.1:18788" \
+                --data-dir "${data_dir}" \
+                --admin-password "test-admin-password" | tee "${log_file}"
 
           grep -q "x86_64-unknown-linux-gnu" "${log_file}"
           test -x "${bin_dir}/codex-proxy"
+          test -x "${share_dir}/codex-proxy/bin/codex-proxy"
           test -f "${share_dir}/codex-proxy/ui/dist/index.html"
 
       - name: Verify update script works
@@ -135,33 +152,31 @@ jobs:
           log_file="${install_root}/update.log"
 
           curl -fsSL "https://raw.githubusercontent.com/${repo}/${tag}/scripts/update.sh" \
-            | CODEX_PROXY_REPO="${repo}" \
-              CODEX_PROXY_VERSION="${tag}" \
-              CODEX_PROXY_SCRIPT_REF="${tag}" \
-              CODEX_PROXY_INSTALL_BIN_DIR="${bin_dir}" \
-              CODEX_PROXY_INSTALL_SHARE_DIR="${share_dir}" \
-              bash | tee "${log_file}"
+            | bash -s -- \
+                --repo "${repo}" \
+                --version "${tag}" \
+                --script-ref "${tag}" \
+                --install-bin-dir "${bin_dir}" \
+                --install-share-dir "${share_dir}" | tee "${log_file}"
 
           grep -q "Updating codex-proxy using" "${log_file}"
+          grep -q "Reusing runtime args:" "${log_file}"
           test -x "${bin_dir}/codex-proxy"
+          test -x "${share_dir}/bin/codex-proxy"
           test -f "${share_dir}/ui/dist/index.html"
           test -f "${share_dir}/install-metadata.env"
+          test -f "${share_dir}/runtime-args.sh"
 
       - name: Smoke run service
         shell: bash
         run: |
           set -euo pipefail
           bin="${{ steps.install.outputs.bin_path }}"
-          ui_dist="${{ steps.install.outputs.ui_dist }}"
-          data_dir="$(mktemp -d)"
-          port=18787
+          port="${{ steps.install.outputs.port }}"
+          data_dir="${{ steps.install.outputs.data_dir }}"
 
-          CODEX_PROXY_UI_DIST_DIR="${ui_dist}" \
-          "${bin}" \
-            --bind "127.0.0.1:${port}" \
-            --data-dir "${data_dir}" \
-            --admin-password "test-admin-password" \
-            >"${data_dir}/server.log" 2>&1 &
+          mkdir -p "${data_dir}"
+          "${bin}" >"${data_dir}/server.log" 2>&1 &
           pid=$!
 
           cleanup() {
@@ -192,13 +207,16 @@ jobs:
           install_root="${{ steps.install.outputs.install_root }}"
           bin_dir="${install_root}/bin"
           share_dir="${install_root}/share/codex-proxy"
+          data_dir="${{ steps.install.outputs.data_dir }}"
           log_file="${install_root}/uninstall.log"
 
           curl -fsSL "https://raw.githubusercontent.com/${repo}/${tag}/scripts/uninstall.sh" \
-            | CODEX_PROXY_INSTALL_BIN_DIR="${bin_dir}" \
-              CODEX_PROXY_INSTALL_SHARE_DIR="${share_dir}" \
-              bash | tee "${log_file}"
+            | bash -s -- \
+                --install-bin-dir "${bin_dir}" \
+                --install-share-dir "${share_dir}" \
+                --remove-data-dir | tee "${log_file}"
 
           grep -q "Uninstalled codex-proxy." "${log_file}"
           test ! -e "${bin_dir}/codex-proxy"
           test ! -d "${share_dir}"
+          test ! -e "${data_dir}"
