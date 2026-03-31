@@ -1262,6 +1262,9 @@ async fn proxy_http(
 
         let mut observation = RequestObservation::new(requested_model.clone());
         observation.observe_body_bytes(&body_bytes);
+        if !status.is_success() {
+            observation.observe_http_error_headers(&response_headers);
+        }
         let finalization = observation.finish_http_response(status);
         request_record.finalize(finalization.clone()).await?;
         sync_credential_transient_state(state, &selected.model.id, &finalization).await?;
@@ -1308,6 +1311,9 @@ async fn proxy_responses_ws(
                         .await?;
                     let mut observation = RequestObservation::new(None);
                     observation.observe_body_bytes(&failure.body);
+                    if !failure.status.is_success() {
+                        observation.observe_http_error_headers(&failure.headers);
+                    }
                     let finalization = observation.finish_http_response(failure.status);
                     request_record.finalize(finalization.clone()).await?;
                     sync_credential_transient_state(&state, &credential.id, &finalization).await?;

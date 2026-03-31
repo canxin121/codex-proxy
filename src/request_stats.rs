@@ -24,7 +24,9 @@ use crate::models::UsageTimeBucketRow;
 use crate::models::UsageTimeBucketView;
 use crate::state::AppState;
 use crate::state::AuthenticatedPrincipal;
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
+use base64::Engine;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::protocol::TokenUsage;
@@ -253,6 +255,26 @@ impl RequestObservation {
         self.observe_text_payload(&String::from_utf8_lossy(bytes));
     }
 
+    pub fn observe_http_error_headers(&mut self, headers: &HeaderMap) {
+        let Some(details) = extract_error_details_from_headers(headers) else {
+            return;
+        };
+
+        if self.error_code.is_none() {
+            self.error_code = details.code;
+        }
+        if self.error_message.is_none() {
+            self.error_message = details.message;
+        }
+
+        if self.success.is_none() && (self.error_code.is_some() || self.error_message.is_some()) {
+            self.success = Some(false);
+            if self.error_phase.is_none() {
+                self.error_phase = Some("upstream_http_headers".to_string());
+            }
+        }
+    }
+
     fn observe_text_payload(&mut self, text: &str) {
         if text.trim().is_empty() {
             return;
@@ -352,6 +374,14 @@ impl RequestObservation {
                         extract_error_code(value),
                         extract_error_message(value)
                             .unwrap_or_else(|| "upstream response failed".to_string()),
+                        extract_status_code(value),
+                    );
+                } else if has_explicit_error_payload(value) {
+                    self.mark_failure_if_missing(
+                        "upstream_http_body",
+                        extract_error_code(value),
+                        extract_error_message(value)
+                            .unwrap_or_else(|| "upstream returned an error response".to_string()),
                         extract_status_code(value),
                     );
                 }
@@ -1223,6 +1253,50 @@ fn response_container(value: &Value) -> &Value {
     value.get("response").unwrap_or(value)
 }
 
+fn has_explicit_error_payload(value: &Value) -> bool {
+    response_container(value).get("error").is_some() || value.get("error").is_some()
+}
+
+#[derive(Debug, Clone)]
+struct HeaderErrorDetails {
+    code: Option<String>,
+    message: Option<String>,
+}
+
+fn extract_error_details_from_headers(headers: &HeaderMap) -> Option<HeaderErrorDetails> {
+    let auth_error = headers
+        .get("x-openai-authorization-error")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    let x_error_json = headers
+        .get("x-error-json")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+        })
+        .and_then(|decoded| serde_json::from_slice::<Value>(&decoded).ok());
+
+    let code = x_error_json
+        .as_ref()
+        .and_then(extract_error_code)
+        .or_else(|| auth_error.clone());
+    let message = x_error_json
+        .as_ref()
+        .and_then(extract_error_message)
+        .or(auth_error);
+
+    if code.is_none() && message.is_none() {
+        return None;
+    }
+
+    Some(HeaderErrorDetails { code, message })
+}
+
 fn extract_requested_model_from_value(value: &Value) -> Option<String> {
     value
         .get("model")
@@ -1382,6 +1456,12 @@ fn extract_error_message(value: &Value) -> Option<String> {
     if let Some(message) = error.get("message").and_then(Value::as_str) {
         return Some(message.to_string());
     }
+    if let Some(message) = error.get("detail").and_then(Value::as_str) {
+        return Some(message.to_string());
+    }
+    if let Some(message) = error.get("reason").and_then(Value::as_str) {
+        return Some(message.to_string());
+    }
     error.as_str().map(ToString::to_string)
 }
 
@@ -1405,6 +1485,9 @@ fn extract_incomplete_reason(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderMap;
+    use axum::http::HeaderValue;
+    use base64::Engine;
     use serde_json::json;
 
     #[test]
@@ -1571,5 +1654,81 @@ data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_jsonl\",\"usa
         assert_eq!(usage.input_tokens, 13);
         assert_eq!(usage.output_tokens, 8);
         assert_eq!(usage.total_tokens, 21);
+    }
+
+    #[test]
+    fn request_observation_preserves_plain_http_json_error_details() {
+        let mut observation = RequestObservation::new(None);
+        observation.observe_body_bytes(
+            br#"{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached for gpt-5.1 in organization org-test on tokens per min (TPM): Limit 30000, Used 22999, Requested 12528. Please try again in 11.054s. Visit https://platform.openai.com/account/rate-limits to learn more."}}"#,
+        );
+
+        let finalization = observation.finish_http_response(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(finalization.upstream_status_code, Some(429));
+        assert!(!finalization.request_success);
+        assert_eq!(
+            finalization.error_code.as_deref(),
+            Some("rate_limit_exceeded")
+        );
+        assert_eq!(
+            finalization.error_message.as_deref(),
+            Some(
+                "Rate limit reached for gpt-5.1 in organization org-test on tokens per min (TPM): Limit 30000, Used 22999, Requested 12528. Please try again in 11.054s. Visit https://platform.openai.com/account/rate-limits to learn more."
+            )
+        );
+    }
+
+    #[test]
+    fn request_observation_extracts_error_from_x_error_json_header() {
+        let mut headers = HeaderMap::new();
+        let x_error_json = base64::engine::general_purpose::STANDARD.encode(
+            r#"{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached for gpt-5.1. Please try again in 4.250s."}}"#,
+        );
+        headers.insert(
+            "x-error-json",
+            HeaderValue::from_str(&x_error_json).expect("valid x-error-json header"),
+        );
+
+        let mut observation = RequestObservation::new(None);
+        observation.observe_http_error_headers(&headers);
+
+        let finalization = observation.finish_http_response(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(finalization.upstream_status_code, Some(429));
+        assert!(!finalization.request_success);
+        assert_eq!(
+            finalization.error_code.as_deref(),
+            Some("rate_limit_exceeded")
+        );
+        assert_eq!(
+            finalization.error_message.as_deref(),
+            Some("Rate limit reached for gpt-5.1. Please try again in 4.250s.")
+        );
+    }
+
+    #[test]
+    fn request_observation_prefers_http_body_error_over_header_error() {
+        let mut headers = HeaderMap::new();
+        let x_error_json = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"error":{"code":"token_expired","message":"header fallback message"}}"#);
+        headers.insert(
+            "x-error-json",
+            HeaderValue::from_str(&x_error_json).expect("valid x-error-json header"),
+        );
+
+        let mut observation = RequestObservation::new(None);
+        observation.observe_body_bytes(
+            br#"{"error":{"code":"rate_limit_exceeded","message":"body message wins"}}"#,
+        );
+        observation.observe_http_error_headers(&headers);
+
+        let finalization = observation.finish_http_response(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            finalization.error_code.as_deref(),
+            Some("rate_limit_exceeded")
+        );
+        assert_eq!(
+            finalization.error_message.as_deref(),
+            Some("body message wins")
+        );
     }
 }
