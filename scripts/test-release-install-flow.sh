@@ -16,7 +16,7 @@ Usage:
 
 Options:
   --repo <owner/name>   GitHub repository that owns the release
-  --tag <tag>           Release tag to validate, for example v0.1.1
+  --tag <tag>           Release tag to validate, for example v0.1.2
   --script-ref <ref>    Git ref used to fetch install/update/uninstall scripts
                         Defaults to the same value as --tag
   -h, --help            Show this help

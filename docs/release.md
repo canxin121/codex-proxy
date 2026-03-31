@@ -21,14 +21,14 @@ This repository includes these GitHub Actions workflows:
   - downloads tagged install scripts from GitHub
   - runs real install, update, smoke-run, and uninstall flows
 
-## Create Release 0.1.1
+## Create Release 0.1.2
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
-You can also use the `Release` workflow manually with `tag=v0.1.1`.
+You can also use the `Release` workflow manually with `tag=v0.1.2`.
 
 ## Asset Names
 
