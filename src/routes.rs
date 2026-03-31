@@ -3055,12 +3055,20 @@ fn ui_dist_dir() -> PathBuf {
         );
     }
 
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui").join("dist"));
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("ui")
+            .join("dist"),
+    );
 
     candidates
         .into_iter()
         .find(|candidate| candidate.join("index.html").exists())
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui").join("dist"))
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("ui")
+                .join("dist")
+        })
 }
 
 async fn serve_ui_root() -> Result<Html<String>, AppError> {
