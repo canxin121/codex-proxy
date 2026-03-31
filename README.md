@@ -35,6 +35,44 @@ If you already cloned without submodules:
 git submodule update --init --depth 1
 ```
 
+## Install (One-Liner)
+
+For Linux/macOS (x86_64), install the latest GitHub Release with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh | bash
+```
+
+Linux installer behavior:
+
+- tries `x86_64-unknown-linux-musl` first (recommended default for cross-distro compatibility)
+- falls back to `x86_64-unknown-linux-gnu` if musl asset is unavailable for that tag
+
+Install a specific release tag:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh | CODEX_PROXY_VERSION=v0.1.0 bash
+```
+
+Force a specific target when needed:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh | CODEX_PROXY_TARGET=x86_64-unknown-linux-musl bash
+```
+
+By default, the installer writes:
+
+- binary: `~/.local/bin/codex-proxy`
+- frontend assets: `~/.local/share/codex-proxy/ui/dist`
+
+Override install paths if needed:
+
+```bash
+CODEX_PROXY_INSTALL_BIN_DIR=/usr/local/bin \
+CODEX_PROXY_INSTALL_SHARE_DIR=/usr/local/share/codex-proxy \
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh | bash
+```
+
 ## Frontend console
 
 `codex-proxy` also ships with a Vue 3 admin console under `ui/`.
@@ -59,6 +97,12 @@ pnpm build
 ```
 
 Then run `codex-proxy`; opening the root URL will show the admin console.
+
+If you deploy frontend assets to a custom location, set:
+
+```bash
+export CODEX_PROXY_UI_DIST_DIR=/path/to/ui/dist
+```
 
 ## What it does
 
@@ -117,6 +161,35 @@ Useful auth-related options:
 `--auth-callback-url` is the local callback URL that OpenAI redirects to after browser auth. `codex-proxy` does not have to listen on that URL. The intended flow is: finish login in a browser, let the browser land on that callback URL, then copy the full callback URL from the address bar and send it to the backend through `/admin/auth/browser/:id/complete` or paste it into the Browser Auth import modal.
 
 To stay aligned with the official Codex browser login flow, `--auth-callback-url` must remain an explicit loopback HTTP URL such as `http://localhost:1455/auth/callback`.
+
+## Release Automation
+
+This repo includes GitHub Actions workflows for CI and Release:
+
+- CI: `.github/workflows/ci.yml`
+  - `cargo fmt --check`
+  - `cargo check --locked`
+  - `cargo test --locked`
+  - `ui` build (`pnpm build`)
+- Release: `.github/workflows/release.yml`
+  - triggers on tags matching `v*`
+  - also supports manual `workflow_dispatch` with a `tag` input
+  - publishes platform archives as GitHub Release assets
+  - publishes both Linux musl and Linux gnu artifacts, with musl as the primary distribution target
+
+Create a release by tagging and pushing:
+
+```bash
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+Release asset names follow this format:
+
+- `codex-proxy-<tag>-x86_64-unknown-linux-musl.tar.gz`
+- `codex-proxy-<tag>-x86_64-unknown-linux-gnu.tar.gz`
+- `codex-proxy-<tag>-x86_64-apple-darwin.tar.gz`
+- `codex-proxy-<tag>-x86_64-pc-windows-msvc.zip`
 
 ## Important routes
 

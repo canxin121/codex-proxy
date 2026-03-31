@@ -1,0 +1,182 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (example: v0.1.1)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name || github.event.inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-ui:
+    name: Build UI Assets
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Install UI Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build UI
+        run: pnpm build
+
+      - name: Upload UI Dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+          if-no-files-found: error
+
+  package:
+    name: Package ${{ matrix.target }}
+    needs:
+      - build-ui
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive_ext: tar.gz
+            bin_name: codex-proxy
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+            bin_name: codex-proxy
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+            bin_name: codex-proxy
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+            bin_name: codex-proxy.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Download UI Dist
+        uses: actions/download-artifact@v5
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl Toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Resolve Release Tag
+        id: vars
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "release_tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg_root="codex-proxy-${{ matrix.target }}"
+          mkdir -p "${pkg_root}/ui"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "${pkg_root}/codex-proxy"
+          cp -R ui/dist "${pkg_root}/ui/dist"
+          archive="codex-proxy-${{ steps.vars.outputs.release_tag }}-${{ matrix.target }}.${{ matrix.archive_ext }}"
+          tar -czf "${archive}" "${pkg_root}"
+          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $pkgRoot = "codex-proxy-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path "$pkgRoot/ui" -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "$pkgRoot/codex-proxy.exe"
+          Copy-Item "ui/dist" "$pkgRoot/ui/dist" -Recurse -Force
+          $archive = "codex-proxy-${{ steps.vars.outputs.release_tag }}-${{ matrix.target }}.${{ matrix.archive_ext }}"
+          Compress-Archive -Path $pkgRoot -DestinationPath $archive -Force
+          "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload Package Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve Release Tag
+        id: vars
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "release_tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download Release Artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.release_tag }}
+          generate_release_notes: true
+          files: dist/*

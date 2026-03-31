@@ -3020,7 +3020,47 @@ async fn sync_credential_transient_state(
 }
 
 fn ui_dist_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui/dist")
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Ok(custom_path) = std::env::var("CODEX_PROXY_UI_DIST_DIR") {
+        let trimmed = custom_path.trim();
+        if !trimmed.is_empty() {
+            candidates.push(PathBuf::from(trimmed));
+        }
+    }
+
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(exe_dir) = exe_path.parent()
+    {
+        candidates.push(exe_dir.join("ui").join("dist"));
+        candidates.push(
+            exe_dir
+                .join("..")
+                .join("share")
+                .join("codex-proxy")
+                .join("ui")
+                .join("dist"),
+        );
+        candidates.push(exe_dir.join("dist"));
+    }
+
+    if let Some(home_dir) = std::env::var_os("HOME") {
+        candidates.push(
+            PathBuf::from(home_dir)
+                .join(".local")
+                .join("share")
+                .join("codex-proxy")
+                .join("ui")
+                .join("dist"),
+        );
+    }
+
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui").join("dist"));
+
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("index.html").exists())
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui").join("dist"))
 }
 
 async fn serve_ui_root() -> Result<Html<String>, AppError> {
