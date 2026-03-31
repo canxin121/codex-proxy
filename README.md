@@ -30,6 +30,9 @@ curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/
       --admin-password 'change-me'
 ```
 
+On Linux with `systemd --user` available, installation also creates and starts a
+user-level service by default. It never creates a system-level service.
+
 Or run from source:
 
 ```bash

@@ -77,6 +77,7 @@ jobs:
                 --version "${tag}" \
                 --install-bin-dir "${bin_dir}" \
                 --install-share-dir "${share_dir}/codex-proxy" \
+                --service-mode none \
                 -- \
                 --bind "127.0.0.1:${port}" \
                 --data-dir "${data_dir}" \
@@ -130,6 +131,7 @@ jobs:
                 --target "x86_64-unknown-linux-gnu" \
                 --install-bin-dir "${bin_dir}" \
                 --install-share-dir "${share_dir}/codex-proxy" \
+                --service-mode none \
                 -- \
                 --bind "127.0.0.1:18788" \
                 --data-dir "${data_dir}" \
@@ -157,7 +159,8 @@ jobs:
                 --version "${tag}" \
                 --script-ref "${tag}" \
                 --install-bin-dir "${bin_dir}" \
-                --install-share-dir "${share_dir}" | tee "${log_file}"
+                --install-share-dir "${share_dir}" \
+                --service-mode none | tee "${log_file}"
 
           grep -q "Updating codex-proxy using" "${log_file}"
           grep -q "Reusing runtime args:" "${log_file}"

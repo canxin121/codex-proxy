@@ -17,6 +17,8 @@ Linux installer behavior:
 
 - Tries `x86_64-unknown-linux-musl` first.
 - Falls back to `x86_64-unknown-linux-gnu` if musl is unavailable for that tag.
+- On Linux with `systemd --user` available, creates and starts a user-level
+  service by default.
 
 Everything after the installer `--` separator is saved and reused whenever the
 installed `codex-proxy` launcher runs.
@@ -64,6 +66,23 @@ Installed files default to:
 The installer only creates user-space files. It does not create a system-level
 service.
 
+If the Linux user manager is available, the default install flow enables and
+starts:
+
+```bash
+systemctl --user status codex-proxy.service
+```
+
+To opt out of service creation and only install files:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/install.sh \
+  | bash -s -- --service-mode none -- \
+      --bind 127.0.0.1:8787 \
+      --data-dir "$HOME/.local/share/codex-proxy/data" \
+      --admin-password 'change-me'
+```
+
 Saved runtime args are stored on disk so the launcher can reuse them. That
 includes secrets such as `--admin-password`. The script writes those files with
 user-only permissions.
@@ -97,6 +116,9 @@ curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/
 If no runtime args are passed after `--`, `update.sh` reuses the existing saved
 runtime args.
 
+If a user-level service is installed, `update.sh` refreshes the files and
+restarts that service.
+
 If you need to change saved options such as `--bind`, `--data-dir`, or
 `--admin-password`, rerun `update.sh` with a new runtime-args section instead
 of passing duplicate flags to the launcher.
@@ -124,3 +146,5 @@ Or provide the data dir explicitly:
 curl -fsSL https://raw.githubusercontent.com/canxin121/codex-proxy/main/scripts/uninstall.sh \
   | bash -s -- --remove-data-dir --data-dir /path/to/codex-proxy-data
 ```
+
+If a user-level service exists, uninstall also stops, disables, and removes it.

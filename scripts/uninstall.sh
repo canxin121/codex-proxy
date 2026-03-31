@@ -8,6 +8,9 @@ DATA_DIR=""
 
 INSTALL_BIN_DIR_EXPLICIT=0
 INSTALL_SHARE_DIR_EXPLICIT=0
+SERVICE_NAME="codex-proxy"
+SERVICE_MANAGER="none"
+SERVICE_UNIT_PATH=""
 
 usage() {
   cat <<'EOF'
@@ -33,6 +36,18 @@ require_option_value() {
     echo "error: ${option} requires a value" >&2
     exit 1
   fi
+}
+
+normalize_service_name() {
+  local raw_name="$1"
+  if [[ "${raw_name}" == *.service ]]; then
+    raw_name="${raw_name%.service}"
+  fi
+  if [[ -z "${raw_name}" || ! "${raw_name}" =~ ^[A-Za-z0-9_.@-]+$ ]]; then
+    echo "error: invalid service name: ${raw_name}" >&2
+    exit 1
+  fi
+  printf '%s\n' "${raw_name}"
 }
 
 parse_args() {
@@ -103,6 +118,9 @@ load_existing_metadata() {
   if [[ "${INSTALL_SHARE_DIR_EXPLICIT}" -eq 0 ]]; then
     INSTALL_SHARE_DIR="${CODEX_PROXY_METADATA_INSTALL_SHARE_DIR:-${CODEX_PROXY_INSTALL_SHARE_DIR:-${INSTALL_SHARE_DIR}}}"
   fi
+  SERVICE_NAME="$(normalize_service_name "${CODEX_PROXY_METADATA_SERVICE_NAME:-${SERVICE_NAME}}")"
+  SERVICE_MANAGER="${CODEX_PROXY_METADATA_SERVICE_MANAGER:-${SERVICE_MANAGER}}"
+  SERVICE_UNIT_PATH="${CODEX_PROXY_METADATA_SERVICE_UNIT_PATH:-${SERVICE_UNIT_PATH}}"
 }
 
 extract_data_dir_from_runtime_args() {
@@ -138,6 +156,40 @@ extract_data_dir_from_runtime_args() {
   done
 }
 
+systemd_user_dir() {
+  printf '%s\n' "${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
+}
+
+systemd_user_unit_name() {
+  printf '%s.service\n' "${SERVICE_NAME}"
+}
+
+remove_user_service() {
+  local unit_name unit_path wants_link
+
+  unit_name="$(systemd_user_unit_name)"
+  unit_path="${SERVICE_UNIT_PATH:-$(systemd_user_dir)/${unit_name}}"
+  wants_link="$(systemd_user_dir)/default.target.wants/${unit_name}"
+
+  if [[ "${SERVICE_MANAGER}" != "systemd-user" && ! -f "${unit_path}" && ! -L "${wants_link}" ]]; then
+    return 1
+  fi
+
+  if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active default.target >/dev/null 2>&1; then
+    systemctl --user disable --now "${unit_name}" >/dev/null 2>&1 || true
+  fi
+
+  rm -f "${unit_path}"
+  rm -f "${wants_link}"
+
+  if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active default.target >/dev/null 2>&1; then
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+
+  echo "Removed user service: ${unit_name}"
+  return 0
+}
+
 main() {
   local launcher_path removed_any inferred_data_dir
   removed_any=0
@@ -146,6 +198,10 @@ main() {
   load_existing_metadata
 
   launcher_path="${INSTALL_BIN_DIR}/codex-proxy"
+
+  if remove_user_service; then
+    removed_any=1
+  fi
 
   if [[ -e "${launcher_path}" ]]; then
     rm -f "${launcher_path}"

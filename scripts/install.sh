@@ -7,6 +7,10 @@ TARGET_OVERRIDE=""
 INSTALL_BIN_DIR="${HOME}/.local/bin"
 INSTALL_SHARE_DIR="${HOME}/.local/share/codex-proxy"
 RUNTIME_ARGS=()
+SERVICE_MODE="auto"
+SERVICE_NAME="codex-proxy"
+SERVICE_MANAGER="none"
+SERVICE_UNIT_PATH=""
 CLEANUP_TMP_DIR=""
 
 usage() {
@@ -20,6 +24,8 @@ Installer options:
   --target <triple>            Force a specific release target
   --install-bin-dir <path>     Directory for the user-facing launcher
   --install-share-dir <path>   Directory for shared files and the real binary
+  --service-mode <mode>        auto, user, or none
+  --service-name <name>        User-service base name (default: codex-proxy)
   -h, --help                   Show this help
 
 Everything after `--` is persisted and used as default arguments whenever the
@@ -58,6 +64,32 @@ require_option_value() {
     echo "error: ${option} requires a value" >&2
     exit 1
   fi
+}
+
+normalize_service_name() {
+  local raw_name="$1"
+  if [[ "${raw_name}" == *.service ]]; then
+    raw_name="${raw_name%.service}"
+  fi
+  if [[ -z "${raw_name}" || ! "${raw_name}" =~ ^[A-Za-z0-9_.@-]+$ ]]; then
+    echo "error: invalid service name: ${raw_name}" >&2
+    exit 1
+  fi
+  printf '%s\n' "${raw_name}"
+}
+
+normalize_service_mode() {
+  local raw_mode="$1"
+  case "${raw_mode}" in
+    auto|user|none)
+      printf '%s\n' "${raw_mode}"
+      ;;
+    *)
+      echo "error: invalid --service-mode value: ${raw_mode}" >&2
+      echo "expected one of: auto, user, none" >&2
+      exit 1
+      ;;
+  esac
 }
 
 parse_args() {
@@ -110,6 +142,24 @@ parse_args() {
         ;;
       --install-share-dir=*)
         INSTALL_SHARE_DIR="${1#*=}"
+        shift
+        ;;
+      --service-mode)
+        require_option_value "$1" "${2:-}"
+        SERVICE_MODE="$(normalize_service_mode "$2")"
+        shift 2
+        ;;
+      --service-mode=*)
+        SERVICE_MODE="$(normalize_service_mode "${1#*=}")"
+        shift
+        ;;
+      --service-name)
+        require_option_value "$1" "${2:-}"
+        SERVICE_NAME="$(normalize_service_name "$2")"
+        shift 2
+        ;;
+      --service-name=*)
+        SERVICE_NAME="$(normalize_service_name "${1#*=}")"
         shift
         ;;
       --)
@@ -193,6 +243,24 @@ download_archive() {
   return 1
 }
 
+systemd_user_dir() {
+  printf '%s\n' "${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
+}
+
+systemd_user_unit_name() {
+  printf '%s.service\n' "${SERVICE_NAME}"
+}
+
+is_systemd_user_available() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    return 1
+  fi
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 1
+  fi
+  systemctl --user is-active default.target >/dev/null 2>&1
+}
+
 write_runtime_args() {
   local runtime_args_path="$1"
   shift
@@ -235,6 +303,95 @@ EOF
   chmod +x "${wrapper_path}"
 }
 
+write_systemd_user_service() {
+  local unit_path="$1"
+  local wrapper_path="$2"
+
+  cat > "${unit_path}" <<EOF
+[Unit]
+Description=codex-proxy user service
+After=default.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${wrapper_path}
+Restart=always
+RestartSec=2
+WorkingDirectory=${HOME}
+
+[Install]
+WantedBy=default.target
+EOF
+
+  chmod 644 "${unit_path}"
+}
+
+install_user_service() {
+  local wrapper_path="$1"
+  local unit_dir unit_name unit_path linger_status
+
+  if [[ "${SERVICE_MODE}" == "none" ]]; then
+    return 0
+  fi
+
+  if [[ "${#RUNTIME_ARGS[@]}" -eq 0 ]]; then
+    if [[ "${SERVICE_MODE}" == "user" ]]; then
+      echo "error: cannot create a user service without saved runtime args" >&2
+      exit 1
+    fi
+    echo "  user service: skipped (no saved runtime args)" >&2
+    return 0
+  fi
+
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    if [[ "${SERVICE_MODE}" == "user" ]]; then
+      echo "error: user-service installation is currently supported on Linux with systemd --user" >&2
+      exit 1
+    fi
+    echo "  user service: skipped (automatic user service is currently supported on Linux with systemd --user)" >&2
+    return 0
+  fi
+
+  if ! is_systemd_user_available; then
+    if [[ "${SERVICE_MODE}" == "user" ]]; then
+      echo "error: systemd --user is not available in the current session" >&2
+      exit 1
+    fi
+    echo "  user service: skipped (systemd --user is not available in the current session)" >&2
+    return 0
+  fi
+
+  unit_dir="$(systemd_user_dir)"
+  unit_name="$(systemd_user_unit_name)"
+  unit_path="${unit_dir}/${unit_name}"
+
+  mkdir -p "${unit_dir}"
+  write_systemd_user_service "${unit_path}" "${wrapper_path}"
+
+  systemctl --user daemon-reload
+  systemctl --user enable "${unit_name}" >/dev/null
+  if systemctl --user is-active --quiet "${unit_name}"; then
+    systemctl --user restart "${unit_name}" >/dev/null
+  else
+    systemctl --user start "${unit_name}" >/dev/null
+  fi
+
+  SERVICE_MANAGER="systemd-user"
+  SERVICE_UNIT_PATH="${unit_path}"
+
+  echo "  user service: ${unit_name}" >&2
+  echo "  user service file: ${unit_path}" >&2
+
+  linger_status="$(loginctl show-user "${USER}" -p Linger 2>/dev/null || true)"
+  if [[ "${linger_status}" == "Linger=yes" ]]; then
+    echo "  user service auto-start: enabled" >&2
+  else
+    echo "  user service auto-start: enabled for your user session/login" >&2
+    echo "  note: to keep it running without an active login session, enable linger with: sudo loginctl enable-linger ${USER}" >&2
+  fi
+}
+
 write_install_metadata() {
   local metadata_path="$1"
   local selected_target="$2"
@@ -253,6 +410,10 @@ write_install_metadata() {
     printf 'CODEX_PROXY_METADATA_REAL_BIN_PATH=%q\n' "${real_bin_path}"
     printf 'CODEX_PROXY_METADATA_UI_DIST=%q\n' "${ui_dist_path}"
     printf 'CODEX_PROXY_METADATA_RUNTIME_ARGS_FILE=%q\n' "${runtime_args_path}"
+    printf 'CODEX_PROXY_METADATA_SERVICE_MODE=%q\n' "${SERVICE_MODE}"
+    printf 'CODEX_PROXY_METADATA_SERVICE_NAME=%q\n' "${SERVICE_NAME}"
+    printf 'CODEX_PROXY_METADATA_SERVICE_MANAGER=%q\n' "${SERVICE_MANAGER}"
+    printf 'CODEX_PROXY_METADATA_SERVICE_UNIT_PATH=%q\n' "${SERVICE_UNIT_PATH}"
   } > "${metadata_path}"
 
   chmod 600 "${metadata_path}"
@@ -379,6 +540,7 @@ main() {
 
   write_runtime_args "${runtime_args_path}" "${RUNTIME_ARGS[@]}"
   write_launcher_script "${wrapper_dst}" "${real_bin_dst}" "${runtime_args_path}" "${ui_dst}"
+  install_user_service "${wrapper_dst}"
   write_install_metadata \
     "${metadata_path}" \
     "${selected_target}" \
@@ -399,6 +561,14 @@ main() {
   print_runtime_args
   echo
   echo "Installed launcher runs as the current user. No system-level service was created."
+  if [[ "${SERVICE_MANAGER}" == "systemd-user" ]]; then
+    echo "User service is installed and running: $(systemd_user_unit_name)"
+    echo "Manage it with:"
+    echo "  systemctl --user status $(systemd_user_unit_name)"
+    echo "  systemctl --user restart $(systemd_user_unit_name)"
+    echo "  systemctl --user stop $(systemd_user_unit_name)"
+    echo
+  fi
   echo
   if [[ ":${PATH}:" != *":${INSTALL_BIN_DIR}:"* ]]; then
     echo "Add ${INSTALL_BIN_DIR} to PATH:"
@@ -409,11 +579,14 @@ main() {
     echo "No default runtime args were saved."
     echo "Run manually when needed, for example:"
     echo "  ${wrapper_dst} --bind 127.0.0.1:8787 --data-dir ${INSTALL_SHARE_DIR}/data --admin-password change-me"
-  else
+  elif [[ "${SERVICE_MANAGER}" != "systemd-user" ]]; then
     echo "Start the proxy with the saved args:"
     echo "  ${wrapper_dst}"
     echo
     echo "Additional CLI args are appended after the saved args."
+    echo "If you need to change a saved option such as --bind or --data-dir, rerun update.sh with a new runtime-args section."
+  else
+    echo "The proxy has already been started through the user service."
     echo "If you need to change a saved option such as --bind or --data-dir, rerun update.sh with a new runtime-args section."
   fi
 }

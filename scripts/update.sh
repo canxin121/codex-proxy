@@ -9,12 +9,16 @@ INSTALL_BIN_DIR="${HOME}/.local/bin"
 INSTALL_SHARE_DIR="${HOME}/.local/share/codex-proxy"
 RUNTIME_ARGS=()
 RUNTIME_ARGS_EXPLICIT=0
+SERVICE_MODE="auto"
+SERVICE_NAME="codex-proxy"
 CLEANUP_TMP_DIR=""
 
 REPO_EXPLICIT=0
 TARGET_EXPLICIT=0
 INSTALL_BIN_DIR_EXPLICIT=0
 INSTALL_SHARE_DIR_EXPLICIT=0
+SERVICE_MODE_EXPLICIT=0
+SERVICE_NAME_EXPLICIT=0
 
 usage() {
   cat <<'EOF'
@@ -28,6 +32,8 @@ Installer options:
   --target <triple>            Force a specific release target
   --install-bin-dir <path>     Directory for the user-facing launcher
   --install-share-dir <path>   Directory for shared files and the real binary
+  --service-mode <mode>        auto, user, or none
+  --service-name <name>        User-service base name (default: codex-proxy)
   -h, --help                   Show this help
 
 If no runtime args are passed after `--`, the previously installed runtime args
@@ -59,6 +65,32 @@ require_option_value() {
     echo "error: ${option} requires a value" >&2
     exit 1
   fi
+}
+
+normalize_service_name() {
+  local raw_name="$1"
+  if [[ "${raw_name}" == *.service ]]; then
+    raw_name="${raw_name%.service}"
+  fi
+  if [[ -z "${raw_name}" || ! "${raw_name}" =~ ^[A-Za-z0-9_.@-]+$ ]]; then
+    echo "error: invalid service name: ${raw_name}" >&2
+    exit 1
+  fi
+  printf '%s\n' "${raw_name}"
+}
+
+normalize_service_mode() {
+  local raw_mode="$1"
+  case "${raw_mode}" in
+    auto|user|none)
+      printf '%s\n' "${raw_mode}"
+      ;;
+    *)
+      echo "error: invalid --service-mode value: ${raw_mode}" >&2
+      echo "expected one of: auto, user, none" >&2
+      exit 1
+      ;;
+  esac
 }
 
 parse_args() {
@@ -130,6 +162,28 @@ parse_args() {
         INSTALL_SHARE_DIR_EXPLICIT=1
         shift
         ;;
+      --service-mode)
+        require_option_value "$1" "${2:-}"
+        SERVICE_MODE="$(normalize_service_mode "$2")"
+        SERVICE_MODE_EXPLICIT=1
+        shift 2
+        ;;
+      --service-mode=*)
+        SERVICE_MODE="$(normalize_service_mode "${1#*=}")"
+        SERVICE_MODE_EXPLICIT=1
+        shift
+        ;;
+      --service-name)
+        require_option_value "$1" "${2:-}"
+        SERVICE_NAME="$(normalize_service_name "$2")"
+        SERVICE_NAME_EXPLICIT=1
+        shift 2
+        ;;
+      --service-name=*)
+        SERVICE_NAME="$(normalize_service_name "${1#*=}")"
+        SERVICE_NAME_EXPLICIT=1
+        shift
+        ;;
       --)
         shift
         RUNTIME_ARGS=("$@")
@@ -167,6 +221,12 @@ load_existing_metadata() {
   fi
   if [[ "${INSTALL_SHARE_DIR_EXPLICIT}" -eq 0 ]]; then
     INSTALL_SHARE_DIR="${CODEX_PROXY_METADATA_INSTALL_SHARE_DIR:-${CODEX_PROXY_INSTALL_SHARE_DIR:-${INSTALL_SHARE_DIR}}}"
+  fi
+  if [[ "${SERVICE_MODE_EXPLICIT}" -eq 0 ]]; then
+    SERVICE_MODE="${CODEX_PROXY_METADATA_SERVICE_MODE:-${SERVICE_MODE}}"
+  fi
+  if [[ "${SERVICE_NAME_EXPLICIT}" -eq 0 ]]; then
+    SERVICE_NAME="${CODEX_PROXY_METADATA_SERVICE_NAME:-${SERVICE_NAME}}"
   fi
 
   runtime_args_path="${CODEX_PROXY_METADATA_RUNTIME_ARGS_FILE:-${INSTALL_SHARE_DIR}/runtime-args.sh}"
@@ -259,6 +319,8 @@ main() {
     --repo "${REPO}"
     --install-bin-dir "${INSTALL_BIN_DIR}"
     --install-share-dir "${INSTALL_SHARE_DIR}"
+    --service-mode "${SERVICE_MODE}"
+    --service-name "${SERVICE_NAME}"
   )
 
   if [[ -n "${VERSION}" ]]; then
