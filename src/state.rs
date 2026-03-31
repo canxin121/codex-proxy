@@ -109,6 +109,7 @@ impl AuthenticatedPrincipalKind {
 }
 
 const ADMIN_SESSION_TTL_DAYS: i64 = 30;
+const TRANSIENT_QUOTA_BLOCK_MINUTES: i64 = 5;
 
 pub struct SelectedCredential {
     pub model: credential::Model,
@@ -690,7 +691,6 @@ impl AppState {
         &self,
         credential_id: &str,
         retry_at: Option<DateTime<Utc>>,
-        exhausted_credits: bool,
     ) -> Result<(), AppError> {
         let row_id = format!("{credential_id}:codex");
         let existing = credential_limit::Entity::find_by_id(row_id.clone())
@@ -720,13 +720,8 @@ impl AppState {
             });
 
         active.primary_used_percent = Set(Some(100.0));
-        if let Some(retry_at) = retry_at {
-            active.primary_resets_at = Set(Some(retry_at));
-        }
-        if exhausted_credits {
-            active.has_credits = Set(Some(false));
-            active.unlimited = Set(Some(false));
-        }
+        active.primary_window_minutes = Set(Some(TRANSIENT_QUOTA_BLOCK_MINUTES));
+        active.primary_resets_at = Set(retry_at);
         active.updated_at = Set(now);
 
         if active.id.is_set() && active.credential_id.is_set() {
@@ -801,9 +796,6 @@ impl AppState {
             .await
             .map_err(|err| AppError::internal(err.to_string()))?;
 
-        let primary = snapshot.primary;
-        let secondary = snapshot.secondary;
-        let credits = snapshot.credits;
         let now = Utc::now();
 
         let mut active = existing
@@ -826,25 +818,7 @@ impl AppState {
                 updated_at: Set(now),
             });
 
-        active.limit_name = Set(snapshot.limit_name);
-        active.primary_used_percent = Set(primary.as_ref().map(|window| window.used_percent));
-        active.primary_window_minutes =
-            Set(primary.as_ref().and_then(|window| window.window_minutes));
-        active.primary_resets_at = Set(unix_to_utc(
-            primary.as_ref().and_then(|window| window.resets_at),
-        ));
-        active.secondary_used_percent = Set(secondary.as_ref().map(|window| window.used_percent));
-        active.secondary_window_minutes =
-            Set(secondary.as_ref().and_then(|window| window.window_minutes));
-        active.secondary_resets_at = Set(unix_to_utc(
-            secondary.as_ref().and_then(|window| window.resets_at),
-        ));
-        active.has_credits = Set(credits.as_ref().map(|value| value.has_credits));
-        active.unlimited = Set(credits.as_ref().map(|value| value.unlimited));
-        active.balance = Set(credits.and_then(|value| value.balance));
-        active.plan_type = Set(snapshot
-            .plan_type
-            .map(|plan| format!("{plan:?}").to_ascii_lowercase()));
+        apply_rate_limit_snapshot_to_active_model(&mut active, snapshot);
         active.updated_at = Set(now);
 
         if active.id.is_set() && active.credential_id.is_set() {
@@ -911,17 +885,32 @@ fn assess_credential_quota(
     let mut has_available_credits = false;
 
     for limit in limits {
-        if limit.unlimited == Some(true) || limit.has_credits == Some(true) {
-            has_available_credits = true;
-        }
-        if limit.unlimited == Some(false) && limit.has_credits == Some(false) {
-            available = false;
-            blocked_without_retry = true;
-            remaining_percent = Some(match remaining_percent {
-                Some(current) => current.min(0.0),
-                None => 0.0,
-            });
-            continue;
+        match (limit.unlimited, limit.has_credits) {
+            (Some(true), _) | (_, Some(true)) => {
+                has_available_credits = true;
+            }
+            (Some(false), Some(false)) => {
+                remaining_percent = Some(match remaining_percent {
+                    Some(current) => current.min(0.0),
+                    None => 0.0,
+                });
+                match transient_quota_retry_at(limit.updated_at) {
+                    Some(retry_at) if retry_at > now => {
+                        available = false;
+                        next_retry_at = Some(match next_retry_at {
+                            Some(current) => current.max(retry_at),
+                            None => retry_at,
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        available = false;
+                        blocked_without_retry = true;
+                    }
+                }
+                continue;
+            }
+            _ => {}
         }
 
         for window in [
@@ -997,7 +986,8 @@ fn assess_limit_window(
         });
     }
 
-    let next_retry_at = effective_limit_window_reset_at(resets_at, window_minutes, updated_at);
+    let next_retry_at = effective_limit_window_reset_at(resets_at, window_minutes, updated_at)
+        .or_else(|| transient_quota_retry_at(updated_at));
     match next_retry_at {
         Some(next_retry_at) if next_retry_at > now => Some(LimitWindowAssessment {
             blocked: true,
@@ -1028,6 +1018,43 @@ fn effective_limit_window_reset_at(
             .map(chrono::Duration::minutes)
             .and_then(|duration| updated_at.checked_add_signed(duration))
     })
+}
+
+fn transient_quota_retry_at(updated_at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    updated_at.checked_add_signed(chrono::Duration::minutes(TRANSIENT_QUOTA_BLOCK_MINUTES))
+}
+
+fn apply_rate_limit_snapshot_to_active_model(
+    active: &mut credential_limit::ActiveModel,
+    snapshot: codex_protocol::protocol::RateLimitSnapshot,
+) {
+    let primary = snapshot.primary;
+    let secondary = snapshot.secondary;
+
+    if let Some(limit_name) = snapshot.limit_name {
+        active.limit_name = Set(Some(limit_name));
+    }
+    active.primary_used_percent = Set(primary.as_ref().map(|window| window.used_percent));
+    active.primary_window_minutes = Set(primary.as_ref().and_then(|window| window.window_minutes));
+    active.primary_resets_at = Set(unix_to_utc(
+        primary.as_ref().and_then(|window| window.resets_at),
+    ));
+    active.secondary_used_percent = Set(secondary.as_ref().map(|window| window.used_percent));
+    active.secondary_window_minutes =
+        Set(secondary.as_ref().and_then(|window| window.window_minutes));
+    active.secondary_resets_at = Set(unix_to_utc(
+        secondary.as_ref().and_then(|window| window.resets_at),
+    ));
+
+    if let Some(credits) = snapshot.credits {
+        active.has_credits = Set(Some(credits.has_credits));
+        active.unlimited = Set(Some(credits.unlimited));
+        active.balance = Set(credits.balance);
+    }
+
+    if let Some(plan_type) = snapshot.plan_type {
+        active.plan_type = Set(Some(format!("{plan_type:?}").to_ascii_lowercase()));
+    }
 }
 
 fn score_credential(
@@ -1779,6 +1806,7 @@ async fn retain_latest_auth_session_per_credential(
 #[cfg(test)]
 mod tests {
     use super::CredentialQuotaAssessment;
+    use super::apply_rate_limit_snapshot_to_active_model;
     use super::assess_credential_quota;
     use super::sqlite_database_path;
     use super::sqlite_query_value;
@@ -1787,6 +1815,9 @@ mod tests {
     use crate::error::AppError;
     use chrono::DateTime;
     use chrono::Utc;
+    use codex_protocol::protocol::CreditsSnapshot;
+    use codex_protocol::protocol::RateLimitSnapshot;
+    use codex_protocol::protocol::RateLimitWindow;
     use std::path::PathBuf;
 
     fn timestamp(value: i64) -> DateTime<Utc> {
@@ -1926,10 +1957,117 @@ mod tests {
             assessment,
             CredentialQuotaAssessment {
                 available: false,
+                next_retry_at: Some(timestamp(1_700_000_300)),
+                remaining_percent: Some(0.0),
+                has_available_credits: false,
+            }
+        );
+    }
+
+    #[test]
+    fn assess_credential_quota_recovers_stale_credit_exhaustion_snapshot() {
+        let mut limit = limit_model();
+        limit.has_credits = Some(false);
+        limit.unlimited = Some(false);
+
+        let assessment = assess_credential_quota(&[limit], timestamp(1_700_000_301));
+
+        assert_eq!(
+            assessment,
+            CredentialQuotaAssessment {
+                available: true,
                 next_retry_at: None,
                 remaining_percent: Some(0.0),
                 has_available_credits: false,
             }
         );
+    }
+
+    #[test]
+    fn assess_credential_quota_temporarily_blocks_unknown_full_windows() {
+        let mut limit = limit_model();
+        limit.primary_used_percent = Some(100.0);
+
+        let assessment = assess_credential_quota(&[limit], timestamp(1_700_000_000));
+
+        assert_eq!(
+            assessment,
+            CredentialQuotaAssessment {
+                available: false,
+                next_retry_at: Some(timestamp(1_700_000_300)),
+                remaining_percent: Some(0.0),
+                has_available_credits: false,
+            }
+        );
+    }
+
+    #[test]
+    fn apply_rate_limit_snapshot_preserves_existing_metadata_when_missing() {
+        let mut existing = limit_model();
+        existing.limit_name = Some("codex".to_string());
+        existing.has_credits = Some(true);
+        existing.unlimited = Some(false);
+        existing.balance = Some("12".to_string());
+        existing.plan_type = Some("pro".to_string());
+
+        let mut active = credential_limit::ActiveModel::from(existing);
+        apply_rate_limit_snapshot_to_active_model(
+            &mut active,
+            RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: 42.0,
+                    window_minutes: Some(60),
+                    resets_at: Some(1_700_000_300),
+                }),
+                secondary: None,
+                credits: None,
+                plan_type: None,
+            },
+        );
+
+        assert_eq!(
+            active.limit_name.take().flatten(),
+            Some("codex".to_string())
+        );
+        assert_eq!(active.has_credits.take().flatten(), Some(true));
+        assert_eq!(active.unlimited.take().flatten(), Some(false));
+        assert_eq!(active.balance.take().flatten(), Some("12".to_string()));
+        assert_eq!(active.plan_type.take().flatten(), Some("pro".to_string()));
+        assert_eq!(active.primary_used_percent.take().flatten(), Some(42.0));
+        assert_eq!(active.primary_window_minutes.take().flatten(), Some(60));
+        assert_eq!(
+            active.primary_resets_at.take().flatten(),
+            Some(timestamp(1_700_000_300))
+        );
+    }
+
+    #[test]
+    fn apply_rate_limit_snapshot_overwrites_metadata_when_present() {
+        let mut active = credential_limit::ActiveModel::from(limit_model());
+        apply_rate_limit_snapshot_to_active_model(
+            &mut active,
+            RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                limit_name: Some("codex_other".to_string()),
+                primary: None,
+                secondary: None,
+                credits: Some(CreditsSnapshot {
+                    has_credits: false,
+                    unlimited: true,
+                    balance: Some("99".to_string()),
+                }),
+                plan_type: None,
+            },
+        );
+
+        assert_eq!(
+            active.limit_name.take().flatten(),
+            Some("codex_other".to_string())
+        );
+        assert_eq!(active.has_credits.take().flatten(), Some(false));
+        assert_eq!(active.unlimited.take().flatten(), Some(true));
+        assert_eq!(active.balance.take().flatten(), Some("99".to_string()));
     }
 }

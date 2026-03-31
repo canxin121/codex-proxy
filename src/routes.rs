@@ -144,6 +144,22 @@ struct UpstreamWsHttpFailure {
     body: Vec<u8>,
 }
 
+struct BufferedUpstreamFailureResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+impl BufferedUpstreamFailureResponse {
+    fn new(status: StatusCode, headers: HeaderMap, body: impl Into<Bytes>) -> Self {
+        Self {
+            status,
+            headers,
+            body: body.into(),
+        }
+    }
+}
+
 enum UpstreamWsConnectOutcome {
     Connected(ConnectedUpstreamWebSocket),
     HttpFailure(UpstreamWsHttpFailure),
@@ -1132,11 +1148,27 @@ async fn proxy_http(
     let requested_model = extract_requested_model_from_bytes(&body);
     let allow_failover = preferred_credential.is_none();
     let mut excluded_credentials = HashSet::new();
+    let mut buffered_failover_response: Option<BufferedUpstreamFailureResponse> = None;
 
     loop {
-        let selected = state
+        let selected = match state
             .select_credential(preferred_credential.as_deref(), &excluded_credentials)
-            .await?;
+            .await
+        {
+            Ok(selected) => selected,
+            Err(err) => {
+                if let Some(failure) =
+                    take_buffered_failover_response(&err, &mut buffered_failover_response)
+                {
+                    return build_client_response(
+                        failure.status,
+                        &failure.headers,
+                        Body::from(failure.body),
+                    );
+                }
+                return Err(err);
+            }
+        };
         let mut request_record = start_request_record(
             state,
             RequestRecordStart {
@@ -1271,6 +1303,11 @@ async fn proxy_http(
 
         if allow_failover && should_failover_to_another_credential(&finalization) {
             excluded_credentials.insert(selected.model.id.clone());
+            buffered_failover_response = Some(BufferedUpstreamFailureResponse::new(
+                status,
+                response_headers,
+                body_bytes,
+            ));
             continue;
         }
 
@@ -1288,11 +1325,27 @@ async fn proxy_responses_ws(
     let client_headers = headers.clone();
     let allow_failover = preferred_credential.is_none();
     let mut excluded_credentials = HashSet::new();
+    let mut buffered_failover_response: Option<BufferedUpstreamFailureResponse> = None;
 
     loop {
-        let selected = state
+        let selected = match state
             .select_credential(preferred_credential.as_deref(), &excluded_credentials)
-            .await?;
+            .await
+        {
+            Ok(selected) => selected,
+            Err(err) => {
+                if let Some(failure) =
+                    take_buffered_failover_response(&err, &mut buffered_failover_response)
+                {
+                    return build_client_response(
+                        failure.status,
+                        &failure.headers,
+                        Body::from(failure.body),
+                    );
+                }
+                return Err(err);
+            }
+        };
         let credential = selected.model;
         let credential_id = credential.id.clone();
         let manager = state.auth_manager(&credential_id).await;
@@ -1320,6 +1373,11 @@ async fn proxy_responses_ws(
 
                     if allow_failover && should_failover_to_another_credential(&finalization) {
                         excluded_credentials.insert(credential.id.clone());
+                        buffered_failover_response = Some(BufferedUpstreamFailureResponse::new(
+                            failure.status,
+                            failure.headers,
+                            failure.body,
+                        ));
                         continue;
                     }
 
@@ -2995,11 +3053,7 @@ async fn sync_credential_transient_state(
 
     if let Some(quota_failure) = quota_failure_from_finalization(finalization) {
         state
-            .mark_credential_quota_exhausted(
-                credential_id,
-                quota_failure.retry_at,
-                quota_failure.exhausted_credits,
-            )
+            .mark_credential_quota_exhausted(credential_id, quota_failure.retry_at)
             .await?;
     }
 
@@ -3022,7 +3076,6 @@ async fn sync_credential_transient_state(
 #[derive(Debug, Clone, Copy)]
 struct QuotaFailure {
     retry_at: Option<chrono::DateTime<Utc>>,
-    exhausted_credits: bool,
 }
 
 fn should_failover_to_another_credential(finalization: &RequestRecordFinalization) -> bool {
@@ -3041,21 +3094,22 @@ fn quota_failure_from_finalization(
         .as_deref()
         .map(str::to_ascii_lowercase);
 
-    let exhausted_credits = matches!(
+    let usage_limited = matches!(
         error_code.as_deref(),
         Some("insufficient_quota" | "quota_exceeded")
     ) || error_message.as_deref().is_some_and(|message| {
-        message.contains("purchase more credits") || message.contains("current quota")
+        message.contains("usage limit")
+            || message.contains("purchase more credits")
+            || message.contains("current quota")
     });
 
     let rate_limited = finalization.upstream_status_code
         == Some(i32::from(StatusCode::TOO_MANY_REQUESTS.as_u16()))
         || matches!(error_code.as_deref(), Some("rate_limit_exceeded"));
 
-    if exhausted_credits {
+    if usage_limited {
         return Some(QuotaFailure {
             retry_at: parse_retry_at_from_error_message(finalization.error_message.as_deref()),
-            exhausted_credits: true,
         });
     }
 
@@ -3063,7 +3117,6 @@ fn quota_failure_from_finalization(
         return Some(QuotaFailure {
             retry_at: parse_retry_at_from_error_message(finalization.error_message.as_deref())
                 .or_else(default_retry_at_after_rate_limit),
-            exhausted_credits: false,
         });
     }
 
@@ -3097,6 +3150,16 @@ fn parse_retry_at_from_error_message(message: Option<&str>) -> Option<chrono::Da
 
 fn default_retry_at_after_rate_limit() -> Option<chrono::DateTime<Utc>> {
     Utc::now().checked_add_signed(chrono::Duration::seconds(60))
+}
+
+fn take_buffered_failover_response(
+    selection_error: &AppError,
+    buffered_failover_response: &mut Option<BufferedUpstreamFailureResponse>,
+) -> Option<BufferedUpstreamFailureResponse> {
+    match selection_error {
+        AppError::ServiceUnavailable(_) => buffered_failover_response.take(),
+        _ => None,
+    }
 }
 
 fn ui_dist_dir() -> PathBuf {
@@ -3582,8 +3645,40 @@ mod tests {
 
         let quota_failure = quota_failure_from_finalization(&finalization)
             .expect("quota failure should be detected");
-        assert!(quota_failure.exhausted_credits);
+        assert!(quota_failure.retry_at.is_none());
         assert!(should_failover_to_another_credential(&finalization));
+    }
+
+    #[test]
+    fn buffered_failover_response_is_only_used_for_selection_service_unavailable() {
+        let mut buffered = Some(BufferedUpstreamFailureResponse::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"error":"rate limited"}"#),
+        ));
+
+        assert!(
+            take_buffered_failover_response(
+                &AppError::service_unavailable("no quota"),
+                &mut buffered,
+            )
+            .is_some()
+        );
+        assert!(buffered.is_none());
+
+        let mut buffered = Some(BufferedUpstreamFailureResponse::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"error":"rate limited"}"#),
+        ));
+        assert!(
+            take_buffered_failover_response(
+                &AppError::bad_gateway("upstream failed"),
+                &mut buffered,
+            )
+            .is_none()
+        );
+        assert!(buffered.is_some());
     }
 
     #[test]
