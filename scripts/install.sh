@@ -261,6 +261,24 @@ is_systemd_user_available() {
   systemctl --user is-active default.target >/dev/null 2>&1
 }
 
+stop_existing_user_service_if_running() {
+  local unit_name
+
+  if [[ "${SERVICE_MODE}" == "none" ]]; then
+    return 0
+  fi
+
+  if ! is_systemd_user_available; then
+    return 0
+  fi
+
+  unit_name="$(systemd_user_unit_name)"
+  if systemctl --user is-active --quiet "${unit_name}"; then
+    systemctl --user stop "${unit_name}" >/dev/null
+    echo "  user service stopped before replacing files: ${unit_name}" >&2
+  fi
+}
+
 write_runtime_args() {
   local runtime_args_path="$1"
   shift
@@ -462,7 +480,7 @@ print_runtime_args() {
 
 main() {
   local ext archive_name tmp_dir pkg_root selected_target download_result
-  local real_bin_src real_bin_dst wrapper_dst ui_src ui_dst runtime_args_path metadata_path
+  local real_bin_src real_bin_dst real_bin_tmp wrapper_dst ui_src ui_dst runtime_args_path metadata_path
   local -a target_candidates
 
   parse_args "$@"
@@ -530,8 +548,12 @@ main() {
   runtime_args_path="${INSTALL_SHARE_DIR}/runtime-args.sh"
   metadata_path="${INSTALL_SHARE_DIR}/install-metadata.env"
 
-  cp "${real_bin_src}" "${real_bin_dst}"
-  chmod +x "${real_bin_dst}"
+  stop_existing_user_service_if_running
+
+  real_bin_tmp="${real_bin_dst}.tmp.$$"
+  cp "${real_bin_src}" "${real_bin_tmp}"
+  chmod +x "${real_bin_tmp}"
+  mv -f "${real_bin_tmp}" "${real_bin_dst}"
 
   if [[ -d "${ui_src}" ]]; then
     rm -rf "${ui_dst}"
