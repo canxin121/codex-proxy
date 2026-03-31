@@ -112,14 +112,34 @@ raw_script_url() {
 
 wait_for_user_manager() {
   local attempt
-  for attempt in $(seq 1 60); do
+  for attempt in $(seq 1 120); do
+    if [[ -n "${SYSTEMD_USER_PID}" ]] && ! kill -0 "${SYSTEMD_USER_PID}" >/dev/null 2>&1; then
+      echo "error: systemd --user exited before becoming ready" >&2
+      if [[ -n "${TMP_ROOT}" && -f "${TMP_ROOT}/systemd-user.log" ]]; then
+        sed -n '1,200p' "${TMP_ROOT}/systemd-user.log" >&2
+      fi
+      return 1
+    fi
+
     if systemctl --user is-active default.target >/dev/null 2>&1; then
       return 0
     fi
+
+    # Some CI runners accept user-manager commands before default.target flips to
+    # "active". That is sufficient for the install/update/uninstall flow below.
+    if systemctl --user show-environment >/dev/null 2>&1 \
+      && [[ "$(systemctl --user show default.target --property=LoadState --value 2>/dev/null)" == "loaded" ]]; then
+      return 0
+    fi
+
     sleep 0.5
   done
 
-  echo "error: timed out waiting for systemd --user default.target" >&2
+  echo "error: timed out waiting for systemd --user readiness" >&2
+  if [[ -n "${TMP_ROOT}" && -f "${TMP_ROOT}/systemd-user.log" ]]; then
+    sed -n '1,200p' "${TMP_ROOT}/systemd-user.log" >&2
+  fi
+  systemctl --user --no-pager status default.target >&2 || true
   return 1
 }
 
